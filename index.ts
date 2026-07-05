@@ -31,6 +31,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { TextContent } from "@earendil-works/pi-ai";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -57,6 +58,7 @@ import { Type } from "typebox";
 
 type GitRefUntrackedMode = "ignore" | "overlay" | "commit";
 type InstallDepsMode = "auto" | "copy" | "never";
+type GitCommitMessageMode = "ai" | "timestamp";
 type MiseMode = "auto" | "never";
 
 interface GitRefState {
@@ -100,6 +102,9 @@ interface SandboxConfig {
 	gitCommitTool: boolean;
 	gitAutoCommit: boolean;
 	gitCommitMessagePrefix: string;
+	gitCommitMessageMode: GitCommitMessageMode;
+	gitCommitCoAuthor: string;
+	gitCommitAiMaxDiffBytes: number;
 	gitCommitNoVerify: boolean;
 	gitCommitNoGpgSign: boolean;
 	gitHostTool: boolean;
@@ -126,6 +131,9 @@ const DEFAULT_CONFIG: SandboxConfig = {
 	gitCommitTool: true,
 	gitAutoCommit: true,
 	gitCommitMessagePrefix: "pi sandbox",
+	gitCommitMessageMode: "ai",
+	gitCommitCoAuthor: "Pi <pi@localhost>",
+	gitCommitAiMaxDiffBytes: 20_000,
 	gitCommitNoVerify: true,
 	gitCommitNoGpgSign: true,
 	gitHostTool: true,
@@ -201,8 +209,10 @@ function loadConfig(cwd: string, projectTrusted: boolean, pi: ExtensionAPI): San
 		DEFAULT_CONFIG.gitRefUntrackedMode,
 	);
 	config.installDeps = normalizeChoice(config.installDeps, ["auto", "copy", "never"] as const, DEFAULT_CONFIG.installDeps);
+	config.gitCommitMessageMode = normalizeChoice(config.gitCommitMessageMode, ["ai", "timestamp"] as const, DEFAULT_CONFIG.gitCommitMessageMode);
 	config.mise = normalizeChoice(config.mise, ["auto", "never"] as const, DEFAULT_CONFIG.mise);
 	config.gitCloneDepth = normalizeNonNegativeInteger(config.gitCloneDepth, DEFAULT_CONFIG.gitCloneDepth);
+	config.gitCommitAiMaxDiffBytes = normalizeNonNegativeInteger(config.gitCommitAiMaxDiffBytes, DEFAULT_CONFIG.gitCommitAiMaxDiffBytes);
 
 	if (pi.getFlag("sandbox")) config.enabled = true;
 	if (pi.getFlag("no-sandbox")) config.enabled = false;
@@ -231,8 +241,12 @@ function loadConfig(cwd: string, projectTrusted: boolean, pi: ExtensionAPI): San
 	if (pi.getFlag("sandbox-keep")) config.keep = true;
 	if (pi.getFlag("sandbox-git-auto-commit")) config.gitAutoCommit = true;
 	if (pi.getFlag("sandbox-no-git-auto-commit")) config.gitAutoCommit = false;
+	const gitCommitMessage = pi.getFlag("sandbox-git-commit-message") as string | undefined;
+	if (gitCommitMessage) config.gitCommitMessageMode = normalizeChoice(gitCommitMessage, ["ai", "timestamp"] as const, config.gitCommitMessageMode);
 	const gitCommitPrefix = pi.getFlag("sandbox-git-commit-prefix") as string | undefined;
 	if (gitCommitPrefix) config.gitCommitMessagePrefix = gitCommitPrefix;
+	const gitCommitCoAuthor = pi.getFlag("sandbox-git-commit-coauthor") as string | undefined;
+	if (gitCommitCoAuthor !== undefined) config.gitCommitCoAuthor = gitCommitCoAuthor;
 	const passEnv = parseList(pi.getFlag("sandbox-env"));
 	if (passEnv) config.passEnv = passEnv;
 
@@ -1007,7 +1021,104 @@ exec bash -lc "$cmd"`,
 
 	private autoCommitMessage(): string {
 		const timestamp = new Date().toISOString().replace(/T/, " ").replace(/\.\d+Z$/, " UTC");
-		return `${this.config.gitCommitMessagePrefix}: ${timestamp}`;
+		return this.withCommitCoAuthor(`${this.config.gitCommitMessagePrefix}: ${timestamp}`);
+	}
+
+	private withCommitCoAuthor(message: string): string {
+		const cleaned = message.trim();
+		const coAuthor = this.config.gitCommitCoAuthor.trim();
+		if (!coAuthor || /^Co-authored-by:/im.test(cleaned)) return cleaned;
+		return `${cleaned}\n\nCo-authored-by: ${coAuthor}`;
+	}
+
+	private sanitizeCommitMessage(message: string): string {
+		let cleaned = message
+			.replace(/\r/g, "")
+			.replace(/\0/g, "")
+			.trim();
+		cleaned = cleaned.replace(/^```[a-zA-Z0-9_-]*\s*\n?/, "").replace(/\n?```$/, "").trim();
+		cleaned = cleaned.replace(/^commit message:\s*/i, "").trim();
+		cleaned = cleaned.replace(/^['"]+|['"]+$/g, "").trim();
+		let lines = cleaned.split("\n").map((line) => line.trimEnd());
+		while (lines.length > 0 && !lines[0].trim()) lines.shift();
+		while (lines.length > 0 && !lines[lines.length - 1].trim()) lines.pop();
+		if (lines.length === 0) return this.autoCommitMessage();
+		lines[0] = lines[0].replace(/^[-*]\s+/, "").trim();
+		if (lines[0].length > 100) lines[0] = lines[0].slice(0, 97).trimEnd() + "...";
+		cleaned = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+		return this.withCommitCoAuthor(cleaned || this.autoCommitMessage());
+	}
+
+	private async stagedDiffForCommitMessage(pathspec: string[]): Promise<string> {
+		const [nameStatus, stat, diff] = await Promise.all([
+			this.containerGitChecked(["diff", "--cached", "--name-status", "--", ...pathspec], { timeoutMs: 60_000 }),
+			this.containerGitChecked(["diff", "--cached", "--stat", "--", ...pathspec], { timeoutMs: 60_000 }),
+			this.containerGitChecked(["diff", "--cached", "--no-ext-diff", "--unified=3", "--", ...pathspec], { timeoutMs: 120_000 }),
+		]);
+		const raw = [
+			"Changed files:",
+			nameStatus.stdout.toString().trim() || "(none)",
+			"",
+			"Diff stat:",
+			stat.stdout.toString().trim() || "(none)",
+			"",
+			"Diff:",
+			diff.stdout.toString().trim() || "(no textual diff)",
+		].join("\n");
+		const truncation = truncateHead(raw, { maxLines: Number.MAX_SAFE_INTEGER, maxBytes: this.config.gitCommitAiMaxDiffBytes });
+		return truncation.truncated ? `${truncation.content}\n\n[Diff truncated at ${formatSize(this.config.gitCommitAiMaxDiffBytes)}]` : truncation.content;
+	}
+
+	private async generateCommitMessage(ctx: ExtensionContext | undefined, pathspec: string[]): Promise<string | undefined> {
+		if (this.config.gitCommitMessageMode !== "ai" || !ctx?.model) return undefined;
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+		if (!auth.ok) throw new Error(auth.error);
+		const diffText = await this.stagedDiffForCommitMessage(pathspec);
+		const coAuthor = this.config.gitCommitCoAuthor.trim();
+		const trailerRule = coAuthor ? `- End with exactly this trailer line: Co-authored-by: ${coAuthor}` : "- Do not include co-author trailers.";
+		const stream = streamSimple(
+			ctx.model,
+			{
+				systemPrompt: [
+					"You write high-quality Git commit messages for code changes.",
+					"Return only the commit message text. Do not use Markdown fences or explanations.",
+					"Use this shape:",
+					"<type>: <brief description>",
+					"",
+					"A short body with useful details, if helpful.",
+					"",
+					coAuthor ? `Co-authored-by: ${coAuthor}` : "",
+					"",
+					"Rules:",
+					"- First line must be a conventional commit summary, e.g. fix: handle sandbox permissions.",
+					"- Choose an accurate type such as fix, feat, docs, refactor, test, chore, build, ci, perf, or style.",
+					"- Keep the first line concise, ideally 72 characters or less.",
+					"- Mention the user-visible intent of the change, not implementation noise.",
+					trailerRule,
+				].filter(Boolean).join("\n"),
+				messages: [
+					{
+						role: "user",
+						content: `Generate a Git commit message for this staged diff.\n\n${diffText}`,
+						timestamp: Date.now(),
+					},
+				],
+			},
+			{
+				apiKey: auth.apiKey,
+				headers: auth.headers,
+				env: auth.env,
+				timeoutMs: 60_000,
+				maxRetries: 1,
+			},
+		);
+		const assistant = await stream.result();
+		const content = assistant.content
+			.filter((part): part is TextContent => part.type === "text")
+			.map((part) => part.text)
+			.join("\n")
+			.trim();
+		return content ? this.sanitizeCommitMessage(content) : undefined;
 	}
 
 	private validateHostGitArgs(args: string[]): string | undefined {
@@ -1114,11 +1225,20 @@ exec bash -lc "$cmd"`,
 			.toString()
 			.trim();
 		let committed = false;
-		let commitMessage = message?.trim() || this.autoCommitMessage();
+		let commitMessage = message?.trim();
 		if (status) {
 			await this.containerGitChecked(["add", "-A", "--", ...pathspec], { timeoutMs: 60_000 });
 			const hasStaged = (await this.containerGit(["diff", "--cached", "--quiet", "--exit-code"], { timeoutMs: 60_000 })).code !== 0;
 			if (hasStaged) {
+				if (!commitMessage) {
+					try {
+						commitMessage = await this.generateCommitMessage(ctx, pathspec);
+					} catch (error) {
+						const reason = error instanceof Error ? error.message : String(error);
+						ctx?.ui.notify(`AI commit message generation failed; using fallback: ${reason}`, "warning");
+					}
+				}
+				commitMessage = this.sanitizeCommitMessage(commitMessage || this.autoCommitMessage());
 				const commitArgs = [
 					"-c",
 					"user.name=pi sandbox",
@@ -1157,13 +1277,13 @@ exec bash -lc "$cmd"`,
 
 	async autoCheckpointSandboxChanges(ctx?: ExtensionContext) {
 		if (!this.config.gitAutoCommit) return;
-		const result = await this.checkpointGitRef(this.autoCommitMessage(), ctx);
+		const result = await this.checkpointGitRef(undefined, ctx);
 		if (result.committed || result.imported) ctx?.ui.notify(result.message, "info");
 	}
 
 
 	async checkpoint(ctx?: ExtensionContext) {
-		await this.checkpointGitRef(this.autoCommitMessage(), ctx);
+		await this.checkpointGitRef(undefined, ctx);
 	}
 
 	async shutdown(ctx?: ExtensionContext) {
@@ -1204,7 +1324,7 @@ const grepSchema = Type.Object({
 });
 
 const gitCommitSchema = Type.Object({
-	message: Type.String({ description: "Git commit message for the sandbox checkpoint" }),
+	message: Type.Optional(Type.String({ description: "Git commit message for the sandbox checkpoint. If omitted, Pi generates one from the staged diff." })),
 	paths: Type.Optional(Type.Array(Type.String(), { description: "Optional sandbox paths to stage. Defaults to the project." })),
 });
 
@@ -1229,7 +1349,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerFlag("sandbox-keep", { description: "Keep sandbox container after shutdown", type: "boolean", default: false });
 	pi.registerFlag("sandbox-git-auto-commit", { description: "Auto-checkpoint sandbox changes after each agent turn", type: "boolean", default: false });
 	pi.registerFlag("sandbox-no-git-auto-commit", { description: "Disable automatic sandbox checkpoints", type: "boolean", default: false });
-	pi.registerFlag("sandbox-git-commit-prefix", { description: "Prefix for automatic sandbox checkpoint messages", type: "string" });
+	pi.registerFlag("sandbox-git-commit-message", { description: "Automatic checkpoint message mode: ai or timestamp", type: "string" });
+	pi.registerFlag("sandbox-git-commit-prefix", { description: "Prefix for timestamp fallback sandbox checkpoint messages", type: "string" });
+	pi.registerFlag("sandbox-git-commit-coauthor", { description: "Co-authored-by identity for sandbox checkpoint commits", type: "string" });
 	pi.registerFlag("sandbox-env", { description: "Comma-separated host env vars to pass into sandbox commands", type: "string" });
 
 	const sandbox = new ContainerSandbox(pi);
@@ -1615,6 +1737,8 @@ export default function (pi: ExtensionAPI) {
 					`Host git allowed commands: ${config.gitHostAllowedCommands.join(", ")}`,
 					`Git commit tool: ${config.gitCommitTool}`,
 					`Git auto-commit: ${config.gitAutoCommit}`,
+					`Git commit message mode: ${config.gitCommitMessageMode}`,
+					`Git commit co-author: ${config.gitCommitCoAuthor || "(none)"}`,
 					`Git commit prefix: ${config.gitCommitMessagePrefix}`,
 					`Pass env: ${config.passEnv.length ? config.passEnv.join(", ") : "(none)"}`,
 				].join("\n"),
