@@ -18,14 +18,14 @@
  *   --sandbox-image <image>               Image to use/build
  *   --sandbox-name <name>                 Stable sandbox/ref name (container is derived)
  *   --sandbox-git-clone-depth <n>          1 = shallow default, 0 = full history
- *   --sandbox-install-deps auto|copy|never
- *   --sandbox-keep                        Keep container after shutdown
+ *   --sandbox-install-deps auto|never
+ *   --sandbox-auto-remove                 Remove container after shutdown
  *   --sandbox-env FOO,BAR                 Allowlist host env vars for tool commands
  */
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { createWriteStream, existsSync, readFileSync } from "node:fs";
 import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -56,10 +56,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-type GitRefUntrackedMode = "ignore" | "overlay" | "commit";
-type InstallDepsMode = "auto" | "copy" | "never";
-type GitCommitMessageMode = "ai" | "timestamp";
-type MiseMode = "auto" | "never";
+type HostUntrackedFilesMode = "ignore" | "copy";
+type InstallDepsMode = "auto" | "never";
 
 interface GitRefState {
 	sessionId: string;
@@ -81,72 +79,66 @@ interface GitRefCheckpointResult {
 	sandboxRef?: string;
 }
 
-interface GitCommitResult {
-	committed: boolean;
+interface PendingRebase {
+	oldBase: string;
+	newBase: string;
+	oldSandboxTip: string;
+	expectedCommitCount: number;
+	containerBaseRef: string;
+	startedAt: string;
+}
+
+interface RebaseResult {
+	completed: boolean;
+	conflicted: boolean;
 	message: string;
-	commitHash?: string;
-	sandboxRef?: string;
+	conflictFiles?: string[];
 }
 
 interface SandboxConfig {
-	enabled: boolean;
 	runtime: "container" | "docker" | "podman" | string;
 	image: string;
 	sandboxName: string;
 	installDepsOnReuse: boolean;
-	gitRefNamespace: string;
-	gitRefRequireCleanWorktree: boolean;
-	gitRefUntrackedMode: GitRefUntrackedMode;
+	hostUntrackedFiles: HostUntrackedFilesMode;
 	gitCloneDepth: number;
-	autoBuildImage: boolean;
-	gitCommitTool: boolean;
-	gitAutoCommit: boolean;
-	gitCommitMessagePrefix: string;
-	gitCommitMessageMode: GitCommitMessageMode;
 	gitCommitCoAuthor: string;
 	gitCommitAiMaxDiffBytes: number;
-	gitCommitNoVerify: boolean;
-	gitCommitNoGpgSign: boolean;
-	gitHostTool: boolean;
-	gitHostAllowedCommands: string[];
 	installDeps: InstallDepsMode;
-	installDepsCopyPaths: string[];
-	mise: MiseMode;
-	keep: boolean;
+	autoRemove: boolean;
 	passEnv: string[];
 }
 
 const DEFAULT_IMAGE = "pi-tool-sandbox:latest";
+const GIT_REF_NAMESPACE = "refs/pi-sandbox";
+const FALLBACK_COMMIT_PREFIX = "pi sandbox";
+const PACKAGE_CACHE_VOLUME = "pi-sandbox-package-cache";
+const PACKAGE_CACHE_ROOT = "/var/cache/pi-packages";
+const PACKAGE_CACHE_ENV: Record<string, string> = {
+	npm_config_cache: `${PACKAGE_CACHE_ROOT}/npm`,
+	npm_config_store_dir: `${PACKAGE_CACHE_ROOT}/pnpm`,
+	PNPM_STORE_DIR: `${PACKAGE_CACHE_ROOT}/pnpm`,
+	BUN_INSTALL_CACHE_DIR: `${PACKAGE_CACHE_ROOT}/bun`,
+	PIP_CACHE_DIR: `${PACKAGE_CACHE_ROOT}/pip`,
+	UV_CACHE_DIR: `${PACKAGE_CACHE_ROOT}/uv`,
+};
 const DEFAULT_CONFIG: SandboxConfig = {
-	enabled: true,
 	runtime: "container",
 	image: DEFAULT_IMAGE,
 	sandboxName: "",
 	installDepsOnReuse: false,
-	gitRefNamespace: "refs/pi-sandbox",
-	gitRefRequireCleanWorktree: true,
-	gitRefUntrackedMode: "ignore",
+	hostUntrackedFiles: "ignore",
 	gitCloneDepth: 1,
-	autoBuildImage: true,
-	gitCommitTool: true,
-	gitAutoCommit: true,
-	gitCommitMessagePrefix: "pi sandbox",
-	gitCommitMessageMode: "ai",
 	gitCommitCoAuthor: "Pi <pi@localhost>",
 	gitCommitAiMaxDiffBytes: 20_000,
-	gitCommitNoVerify: true,
-	gitCommitNoGpgSign: true,
-	gitHostTool: true,
-	gitHostAllowedCommands: ["status", "diff", "log", "show", "rev-parse", "ls-files", "grep", "describe"],
 	installDeps: "never",
-	installDepsCopyPaths: ["node_modules", ".venv", "venv"],
-	mise: "auto",
-	keep: false,
+	autoRemove: true,
 	passEnv: [],
 };
 
 interface ExecOptions {
 	cwd?: string;
+	env?: NodeJS.ProcessEnv;
 	input?: string | Buffer;
 	signal?: AbortSignal;
 	timeoutMs?: number;
@@ -175,8 +167,6 @@ function mergeConfig(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sa
 		...base,
 		...overrides,
 		passEnv: parseList(overrides.passEnv) ?? base.passEnv,
-		installDepsCopyPaths: parseList(overrides.installDepsCopyPaths) ?? base.installDepsCopyPaths,
-		gitHostAllowedCommands: parseList(overrides.gitHostAllowedCommands) ?? base.gitHostAllowedCommands,
 	};
 }
 
@@ -203,19 +193,14 @@ function loadConfig(cwd: string, projectTrusted: boolean, pi: ExtensionAPI): San
 	const globalConfig = readJson(path.join(getAgentDir(), "extensions", "container-sandbox.json"));
 	const projectConfig = projectTrusted ? readJson(path.join(cwd, CONFIG_DIR_NAME, "container-sandbox.json")) : {};
 	let config = mergeConfig(mergeConfig(DEFAULT_CONFIG, globalConfig), projectConfig);
-	config.gitRefUntrackedMode = normalizeChoice(
-		config.gitRefUntrackedMode,
-		["ignore", "overlay", "commit"] as const,
-		DEFAULT_CONFIG.gitRefUntrackedMode,
+	config.hostUntrackedFiles = normalizeChoice(
+		config.hostUntrackedFiles,
+		["ignore", "copy"] as const,
+		DEFAULT_CONFIG.hostUntrackedFiles,
 	);
-	config.installDeps = normalizeChoice(config.installDeps, ["auto", "copy", "never"] as const, DEFAULT_CONFIG.installDeps);
-	config.gitCommitMessageMode = normalizeChoice(config.gitCommitMessageMode, ["ai", "timestamp"] as const, DEFAULT_CONFIG.gitCommitMessageMode);
-	config.mise = normalizeChoice(config.mise, ["auto", "never"] as const, DEFAULT_CONFIG.mise);
+	config.installDeps = normalizeChoice(config.installDeps, ["auto", "never"] as const, DEFAULT_CONFIG.installDeps);
 	config.gitCloneDepth = normalizeNonNegativeInteger(config.gitCloneDepth, DEFAULT_CONFIG.gitCloneDepth);
 	config.gitCommitAiMaxDiffBytes = normalizeNonNegativeInteger(config.gitCommitAiMaxDiffBytes, DEFAULT_CONFIG.gitCommitAiMaxDiffBytes);
-
-	if (pi.getFlag("sandbox")) config.enabled = true;
-	if (pi.getFlag("no-sandbox")) config.enabled = false;
 
 	const runtime = pi.getFlag("sandbox-runtime") as string | undefined;
 	if (runtime) config.runtime = runtime;
@@ -223,36 +208,15 @@ function loadConfig(cwd: string, projectTrusted: boolean, pi: ExtensionAPI): San
 	if (image) config.image = image;
 	const sandboxName = pi.getFlag("sandbox-name") as string | undefined;
 	if (sandboxName) config.sandboxName = sandboxName;
-	if (pi.getFlag("sandbox-install-deps-on-reuse")) config.installDepsOnReuse = true;
 	const gitCloneDepth = pi.getFlag("sandbox-git-clone-depth") as string | undefined;
 	if (gitCloneDepth !== undefined) config.gitCloneDepth = normalizeNonNegativeInteger(gitCloneDepth, config.gitCloneDepth);
-	const gitRefUntrackedMode = pi.getFlag("sandbox-git-ref-untracked") as string | undefined;
-	if (gitRefUntrackedMode) {
-		config.gitRefUntrackedMode = normalizeChoice(
-			gitRefUntrackedMode,
-			["ignore", "overlay", "commit"] as const,
-			config.gitRefUntrackedMode,
-		);
-	}
 	const installDeps = pi.getFlag("sandbox-install-deps") as string | undefined;
-	if (installDeps) config.installDeps = normalizeChoice(installDeps, ["auto", "copy", "never"] as const, config.installDeps);
-	const mise = pi.getFlag("sandbox-mise") as string | undefined;
-	if (mise) config.mise = normalizeChoice(mise, ["auto", "never"] as const, config.mise);
-	if (pi.getFlag("sandbox-keep")) config.keep = true;
-	if (pi.getFlag("sandbox-git-auto-commit")) config.gitAutoCommit = true;
-	if (pi.getFlag("sandbox-no-git-auto-commit")) config.gitAutoCommit = false;
-	const gitCommitMessage = pi.getFlag("sandbox-git-commit-message") as string | undefined;
-	if (gitCommitMessage) config.gitCommitMessageMode = normalizeChoice(gitCommitMessage, ["ai", "timestamp"] as const, config.gitCommitMessageMode);
-	const gitCommitPrefix = pi.getFlag("sandbox-git-commit-prefix") as string | undefined;
-	if (gitCommitPrefix) config.gitCommitMessagePrefix = gitCommitPrefix;
-	const gitCommitCoAuthor = pi.getFlag("sandbox-git-commit-coauthor") as string | undefined;
-	if (gitCommitCoAuthor !== undefined) config.gitCommitCoAuthor = gitCommitCoAuthor;
+	if (installDeps) config.installDeps = normalizeChoice(installDeps, ["auto", "never"] as const, config.installDeps);
+	if (pi.getFlag("sandbox-auto-remove")) config.autoRemove = true;
 	const passEnv = parseList(pi.getFlag("sandbox-env"));
 	if (passEnv) config.passEnv = passEnv;
 
 	config.passEnv = uniq(config.passEnv);
-	config.installDepsCopyPaths = uniq(config.installDepsCopyPaths);
-	config.gitHostAllowedCommands = uniq(config.gitHostAllowedCommands);
 	return config;
 }
 
@@ -343,45 +307,12 @@ function getCustomEntryData(entry: unknown, customType: string): unknown | undef
 	return candidate.type === "custom" && candidate.customType === customType ? candidate.data : undefined;
 }
 
-function parseShellWords(input: string): string[] {
-	const words: string[] = [];
-	let current = "";
-	let quote: "'" | '"' | undefined;
-	let escaping = false;
-	for (const char of input) {
-		if (escaping) {
-			current += char;
-			escaping = false;
-			continue;
-		}
-		if (char === "\\" && quote !== "'") {
-			escaping = true;
-			continue;
-		}
-		if ((char === "'" || char === '"') && !quote) {
-			quote = char;
-			continue;
-		}
-		if (quote === char) {
-			quote = undefined;
-			continue;
-		}
-		if (!quote && /\s/.test(char)) {
-			if (current) words.push(current);
-			current = "";
-			continue;
-		}
-		current += char;
-	}
-	if (escaping) current += "\\";
-	if (current) words.push(current);
-	return words;
-}
-
 async function run(command: string, args: string[], options: ExecOptions = {}): Promise<ExecResult> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(command, args, {
 			cwd: options.cwd,
+			env: options.env,
+			shell: false,
 			stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 		});
 
@@ -449,6 +380,50 @@ async function runChecked(command: string, args: string[], options: ExecOptions 
 	return result;
 }
 
+function sanitizedGitEnv(): NodeJS.ProcessEnv {
+	const env = { ...process.env };
+	for (const key of Object.keys(env)) {
+		if (key.startsWith("GIT_")) delete env[key];
+	}
+	return {
+		...env,
+		GIT_CONFIG_NOSYSTEM: "1",
+		GIT_CONFIG_GLOBAL: "/dev/null",
+		GIT_ATTR_NOSYSTEM: "1",
+		GIT_OPTIONAL_LOCKS: "0",
+		GIT_PAGER: "cat",
+		PAGER: "cat",
+		GIT_TERMINAL_PROMPT: "0",
+	};
+}
+
+const INTERNAL_GIT_PREFIX = [
+	"--no-pager",
+	"-c",
+	"core.hooksPath=/dev/null",
+	"-c",
+	"core.fsmonitor=false",
+	"-c",
+	"diff.external=",
+	"-c",
+	"maintenance.auto=false",
+	"-c",
+	"gc.auto=0",
+];
+
+async function runGit(args: string[], options: ExecOptions = {}): Promise<ExecResult> {
+	return run("git", [...INTERNAL_GIT_PREFIX, ...args], { ...options, env: sanitizedGitEnv() });
+}
+
+async function runGitChecked(args: string[], options: ExecOptions = {}): Promise<ExecResult> {
+	const result = await runGit(args, options);
+	if (result.code !== 0) {
+		const stderr = result.stderr.toString().trim();
+		throw new Error(stderr || `git ${args.join(" ")} exited with ${result.code}`);
+	}
+	return result;
+}
+
 async function commandOk(command: string, args: string[]): Promise<boolean> {
 	try {
 		const result = await run(command, args, { timeoutMs: 10_000 });
@@ -458,37 +433,9 @@ async function commandOk(command: string, args: string[]): Promise<boolean> {
 	}
 }
 
-function dockerfile(): string {
-	return `FROM node:24-bookworm-slim
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update \\
-  && apt-get install -y --no-install-recommends \\
-     bash ca-certificates git ripgrep fd-find findutils coreutils curl \\
-     python3 python3-pip python3-venv build-essential procps tar \\
-  && ln -sf /usr/bin/fdfind /usr/local/bin/fd \\
-  && rm -rf /var/lib/apt/lists/*
-WORKDIR /
-CMD ["sleep", "infinity"]
-`;
-}
-
-async function buildDefaultImage(runtime: string, image: string, ctx?: ExtensionContext): Promise<void> {
-	if (await commandOk(runtime, ["image", "inspect", image])) return;
-	if (image !== DEFAULT_IMAGE) {
-		throw new Error(`Sandbox image not found: ${image}`);
-	}
-	ctx?.ui.notify(`Building sandbox image ${image} (first run only)...`, "info");
-	const dir = await mkdtemp(path.join(tmpdir(), "pi-sandbox-image-"));
-	try {
-		await import("node:fs/promises").then((fs) => fs.writeFile(path.join(dir, "Dockerfile"), dockerfile(), "utf8"));
-		await runChecked(runtime, ["build", "-t", image, dir], { timeoutMs: 20 * 60 * 1000 });
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-}
-
 class ContainerSandbox {
 	private config: SandboxConfig = DEFAULT_CONFIG;
+	private enabled = true;
 	private cwd = process.cwd();
 	private containerName: string | undefined;
 	private starting: Promise<void> | undefined;
@@ -496,12 +443,18 @@ class ContainerSandbox {
 	private started = false;
 	private reusedContainer = false;
 	private gitRefState: GitRefState | undefined;
+	private pendingRebase: PendingRebase | undefined;
 	private preflightError: string | undefined;
+	private checkpointTail: Promise<unknown> = Promise.resolve();
 
 	constructor(private readonly pi: ExtensionAPI) {}
 
 	isEnabled() {
-		return this.config.enabled;
+		return this.enabled;
+	}
+
+	hasPendingRebase() {
+		return this.pendingRebase !== undefined;
 	}
 
 	getName() {
@@ -518,18 +471,28 @@ class ContainerSandbox {
 
 	restoreGitRefState(ctx: ExtensionContext) {
 		this.gitRefState = undefined;
-		// An explicit sandbox name is the source of truth for both the ref suffix
-		// and derived container name. Do not let an older session entry override it.
-		if (this.config.sandboxName.trim()) return;
+		this.pendingRebase = undefined;
 		for (const entry of ctx.sessionManager.getBranch()) {
-			const data = getCustomEntryData(entry, "container-sandbox.git-ref-state") as GitRefState | undefined;
-			if (data?.sandboxRef && data?.containerName) this.gitRefState = data;
+			const state = getCustomEntryData(entry, "container-sandbox.git-ref-state") as GitRefState | undefined;
+			if (
+				!this.config.sandboxName.trim() &&
+				state?.sandboxRef.startsWith(`${GIT_REF_NAMESPACE}/`) &&
+				state.containerName
+			) {
+				this.gitRefState = state;
+			}
+			const rebase = getCustomEntryData(entry, "container-sandbox.rebase-state") as
+				| { active?: boolean; pending?: PendingRebase }
+				| undefined;
+			if (rebase?.active && rebase.pending) this.pendingRebase = rebase.pending;
+			else if (rebase?.active === false) this.pendingRebase = undefined;
 		}
 	}
 
 	configure(ctx: ExtensionContext) {
 		this.cwd = ctx.cwd;
 		this.config = loadConfig(ctx.cwd, ctx.isProjectTrusted(), this.pi);
+		this.enabled = !this.pi.getFlag("no-sandbox");
 	}
 
 	private async runtimeExec(args: string[], options: ExecOptions = {}) {
@@ -542,6 +505,7 @@ class ContainerSandbox {
 
 	private envArgs(): string[] {
 		const args: string[] = [];
+		for (const [key, value] of Object.entries(PACKAGE_CACHE_ENV)) args.push("-e", `${key}=${value}`);
 		for (const key of this.config.passEnv) {
 			const value = process.env[key];
 			if (value !== undefined) args.push("-e", `${key}=${value}`);
@@ -549,33 +513,50 @@ class ContainerSandbox {
 		return args;
 	}
 
+	private async ensurePackageCacheVolume() {
+		if ((await this.runtimeExec(["volume", "inspect", PACKAGE_CACHE_VOLUME], { timeoutMs: 10_000 })).code === 0) return;
+		const created = await this.runtimeExec(["volume", "create", PACKAGE_CACHE_VOLUME], { timeoutMs: 60_000 });
+		if (created.code !== 0 && (await this.runtimeExec(["volume", "inspect", PACKAGE_CACHE_VOLUME], { timeoutMs: 10_000 })).code !== 0) {
+			throw new Error(created.stderr.toString().trim() || `Could not create package cache volume ${PACKAGE_CACHE_VOLUME}`);
+		}
+	}
+
+	private async initializePackageCacheDirectories() {
+		if (!this.containerName) throw new Error("Sandbox container is not running");
+		await this.runtimeExecChecked([
+			"exec",
+			"-u",
+			"root",
+			this.containerName,
+			"sh",
+			"-c",
+			`mkdir -p ${PACKAGE_CACHE_ROOT}/npm ${PACKAGE_CACHE_ROOT}/pnpm ${PACKAGE_CACHE_ROOT}/bun ${PACKAGE_CACHE_ROOT}/pip ${PACKAGE_CACHE_ROOT}/uv && chmod 0777 ${PACKAGE_CACHE_ROOT} ${PACKAGE_CACHE_ROOT}/npm ${PACKAGE_CACHE_ROOT}/pnpm ${PACKAGE_CACHE_ROOT}/bun ${PACKAGE_CACHE_ROOT}/pip ${PACKAGE_CACHE_ROOT}/uv`,
+		], { timeoutMs: 30_000 });
+	}
+
 	private async gitRepoRoot(): Promise<string | undefined> {
-		const result = await run("git", ["rev-parse", "--show-toplevel"], { cwd: this.cwd, timeoutMs: 10_000 });
+		const result = await runGit(["rev-parse", "--show-toplevel"], { cwd: this.cwd, timeoutMs: 10_000 });
 		return result.code === 0 ? result.stdout.toString().trim() : undefined;
 	}
 
 	private async gitHead(): Promise<string | undefined> {
-		const result = await run("git", ["rev-parse", "--verify", "HEAD"], { cwd: this.cwd, timeoutMs: 10_000 });
+		const result = await runGit(["rev-parse", "--verify", "HEAD"], { cwd: this.cwd, timeoutMs: 10_000 });
 		return result.code === 0 ? result.stdout.toString().trim() : undefined;
 	}
 
 	private async gitBranchName(baseCommit: string): Promise<string> {
-		const result = await run("git", ["branch", "--show-current"], { cwd: this.cwd, timeoutMs: 10_000 });
+		const result = await runGit(["branch", "--show-current"], { cwd: this.cwd, timeoutMs: 10_000 });
 		const branch = result.stdout.toString().trim();
 		if (result.code === 0 && branch) return branch;
 		return `detached-${baseCommit.slice(0, 12)}`;
 	}
 
-	private async hostUntrackedFiles(repoRoot: string): Promise<string[]> {
-		const result = await runChecked("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
-			cwd: repoRoot,
-			timeoutMs: 30_000,
-		});
-		return result.stdout
-			.toString("utf8")
-			.split("\0")
-			.map((value) => value.trim())
-			.filter((value) => value && !path.isAbsolute(value) && !value.startsWith(".."));
+	private hostUntrackedArgs(repoRoot: string, directoryMode = false): string[] {
+		const args = ["ls-files", "--others", "--exclude-standard"];
+		if (existsSync(path.join(repoRoot, ".pi-sandboxignore"))) args.push("--exclude-from=.pi-sandboxignore");
+		if (directoryMode) args.push("--directory", "--no-empty-directory");
+		args.push("-z");
+		return args;
 	}
 
 	private async sandboxTrackedFiles(state: GitRefState): Promise<Set<string>> {
@@ -586,40 +567,122 @@ class ContainerSandbox {
 		return new Set(result.stdout.toString("utf8").split("\0").filter(Boolean));
 	}
 
-	private async applyGitRefUntrackedFiles(state: GitRefState) {
-		if (this.config.gitRefUntrackedMode === "ignore") return;
-		if (!this.containerName) throw new Error("Sandbox container is not running");
-		const untracked = await this.hostUntrackedFiles(state.repoRoot);
-		if (untracked.length === 0) return;
-		const trackedInSandbox = await this.sandboxTrackedFiles(state).catch(() => new Set<string>());
-		const overlayPaths = untracked.filter((relativePath) => !trackedInSandbox.has(relativePath));
-		if (overlayPaths.length === 0) return;
+	private async writeHostUntrackedList(repoRoot: string, destination: string, trackedInSandbox: Set<string>): Promise<number> {
+		return new Promise<number>((resolve, reject) => {
+			const output = createWriteStream(destination);
+			const child = spawn("git", [...INTERNAL_GIT_PREFIX, ...this.hostUntrackedArgs(repoRoot)], {
+				cwd: repoRoot,
+				env: sanitizedGitEnv(),
+				shell: false,
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			let remainder = Buffer.alloc(0);
+			let stderr = "";
+			let count = 0;
+			let settled = false;
+			const fail = (error: Error) => {
+				if (settled) return;
+				settled = true;
+				child.kill("SIGKILL");
+				output.destroy();
+				reject(error);
+			};
+			const writeEntries = (chunk: Buffer) => {
+				const combined = remainder.length ? Buffer.concat([remainder, chunk]) : chunk;
+				const accepted: Buffer[] = [];
+				let start = 0;
+				for (let end = combined.indexOf(0, start); end >= 0; end = combined.indexOf(0, start)) {
+					const entry = combined.subarray(start, end);
+					start = end + 1;
+					const relativePath = entry.toString("utf8");
+					if (relativePath && !path.isAbsolute(relativePath) && !relativePath.startsWith("..") && !trackedInSandbox.has(relativePath)) {
+						accepted.push(entry, Buffer.from([0]));
+						count++;
+					}
+				}
+				remainder = combined.subarray(start);
+				if (accepted.length > 0 && !output.write(Buffer.concat(accepted))) {
+					child.stdout.pause();
+					output.once("drain", () => child.stdout.resume());
+				}
+			};
+			child.stdout.on("data", writeEntries);
+			child.stderr.on("data", (data) => (stderr += data.toString()));
+			child.on("error", fail);
+			output.on("error", fail);
+			child.on("close", (code) => {
+				if (settled) return;
+				if (code !== 0) return fail(new Error(stderr.trim() || `git ls-files exited with ${code}`));
+				if (remainder.length > 0) return fail(new Error("git ls-files returned an unterminated path"));
+				output.end();
+			});
+			output.on("finish", () => {
+				if (settled) return;
+				settled = true;
+				resolve(count);
+			});
+		});
+	}
 
+	private async copyListedHostFilesToContainer(listPath: string, repoRoot: string) {
+		if (!this.containerName) throw new Error("Sandbox container is not running");
+		await new Promise<void>((resolve, reject) => {
+			const source = spawn("tar", ["cf", "-", "-C", repoRoot, "--null", "-T", listPath], {
+				stdio: ["ignore", "pipe", "pipe"],
+				env: tarEnv(),
+			});
+			const dest = spawn(this.config.runtime, ["exec", "-i", "-u", "root", this.containerName!, "tar", "xf", "-", "-C", repoRoot], {
+				stdio: ["pipe", "ignore", "pipe"],
+			});
+			let err = "";
+			let sourceCode: number | null | undefined;
+			let destCode: number | null | undefined;
+			const done = () => {
+				if (sourceCode === undefined || destCode === undefined) return;
+				if (sourceCode !== 0) reject(new Error(err.trim() || `tar exited with ${sourceCode}`));
+				else if (destCode !== 0) reject(new Error(err.trim() || `container tar exited with ${destCode}`));
+				else resolve();
+			};
+			source.stderr.on("data", (data) => (err += data.toString()));
+			dest.stderr.on("data", (data) => (err += data.toString()));
+			source.on("error", reject);
+			dest.on("error", reject);
+			source.on("close", (code) => { sourceCode = code; done(); });
+			dest.on("close", (code) => { destCode = code; done(); });
+			source.stdout.pipe(dest.stdin);
+		});
+	}
+
+	private async applyGitRefUntrackedFiles(state: GitRefState) {
+		if (this.config.hostUntrackedFiles === "ignore") return;
+		if (!this.containerName) throw new Error("Sandbox container is not running");
+		const trackedInSandbox = await this.sandboxTrackedFiles(state).catch(() => new Set<string>());
 		const temp = await mkdtemp(path.join(tmpdir(), "pi-sandbox-untracked-"));
+		const listPath = path.join(temp, "host-untracked.zlist");
 		try {
-			for (const relativePath of overlayPaths) {
-				const source = path.join(state.repoRoot, relativePath);
-				const target = path.join(temp, relativePath);
-				await mkdir(path.dirname(target), { recursive: true });
-				await cp(source, target, { recursive: true, dereference: false, preserveTimestamps: true, force: true });
-			}
-			await this.copyDirectoryToContainer(temp, state.repoRoot);
+			const count = await this.writeHostUntrackedList(state.repoRoot, listPath, trackedInSandbox);
+			if (count > 0) await this.copyListedHostFilesToContainer(listPath, state.repoRoot);
+			await this.runtimeExecChecked(["exec", "-u", "root", this.containerName, "mkdir", "-p", path.posix.join(toPosix(state.repoRoot), ".git/info")]);
+			await this.runtimeExecChecked([
+				"cp",
+				listPath,
+				`${this.containerName}:${path.posix.join(toPosix(state.repoRoot), ".git/info/pi-sandbox-host-untracked")}`,
+			], { timeoutMs: 30_000 });
+
+			const compact = await runGitChecked(this.hostUntrackedArgs(state.repoRoot, true), { cwd: state.repoRoot, timeoutMs: 30_000 });
+			const patterns = compact.stdout.toString("utf8").split("\0").filter((value) => value && !value.includes("\n"));
+			const excludeText = [
+				"# BEGIN pi sandbox host untracked files",
+				...patterns.map((relativePath) => `/${toPosix(relativePath)}`),
+				"# END pi sandbox host untracked files",
+				"",
+			].join("\n");
+			await this.runtimeExecChecked([
+				"exec", "-i", "-u", "root", "-w", state.repoRoot, this.containerName, "sh", "-c",
+				"mkdir -p .git/info; touch .git/info/exclude; awk '/^# BEGIN pi sandbox host untracked files$/{skip=1;next} /^# END pi sandbox host untracked files$/{skip=0;next} !skip{print}' .git/info/exclude > .git/info/exclude.pi-tmp; cat >> .git/info/exclude.pi-tmp; mv .git/info/exclude.pi-tmp .git/info/exclude",
+			], { input: excludeText, timeoutMs: 30_000 });
 		} finally {
 			await rm(temp, { recursive: true, force: true });
-		}
-
-		if (this.config.gitRefUntrackedMode === "overlay") {
-			const excludeText =
-				"\n# pi sandbox untracked overlay (copied from host, intentionally not committed)\n" +
-				overlayPaths.map((relativePath) => `/${toPosix(relativePath)}`).join("\n") +
-				"\n";
-			// copyDirectoryToContainer untars as root, and a freshly seeded repo is
-			// chowned only after untracked overlay is applied. Append as root here;
-			// prepareGitRefWorkspace chowns the repo back to the container user.
-			await this.runtimeExecChecked(["exec", "-i", "-u", "root", "-w", state.repoRoot, this.containerName, "sh", "-c", "mkdir -p .git/info && cat >> .git/info/exclude"], {
-				input: excludeText,
-				timeoutMs: 10_000,
-			});
 		}
 	}
 
@@ -636,8 +699,7 @@ class ContainerSandbox {
 		if (!baseCommit) throw new Error("git repository has no commits yet (HEAD is unborn)");
 		const baseBranch = await this.gitBranchName(baseCommit);
 		const branchRefPath = safeRefPath(baseBranch);
-		const namespace = this.config.gitRefNamespace.replace(/\/+$/g, "") || "refs/pi-sandbox";
-		const sandboxRef = `${namespace}/${branchRefPath}/${refSuffix}`;
+		const sandboxRef = `${GIT_REF_NAMESPACE}/${branchRefPath}/${refSuffix}`;
 		const repoName = safeName(path.basename(repoRoot), "repo");
 		const branchName = safeName(baseBranch.replace(/\//g, "-"), "branch");
 		const containerName = `pi-${repoName}-${branchName}-${sessionKey}`.slice(0, 120);
@@ -649,35 +711,30 @@ class ContainerSandbox {
 	}
 
 	private async ensureHostSandboxRef(state: GitRefState) {
-		const exists = (await run("git", ["show-ref", "--verify", "--quiet", state.sandboxRef], { cwd: this.cwd, timeoutMs: 10_000 })).code === 0;
-		if (!exists) await runChecked("git", ["update-ref", state.sandboxRef, state.baseCommit], { cwd: this.cwd, timeoutMs: 10_000 });
+		const exists = (await runGit(["show-ref", "--verify", "--quiet", state.sandboxRef], { cwd: this.cwd, timeoutMs: 10_000 })).code === 0;
+		if (!exists) await runGitChecked(["update-ref", state.sandboxRef, state.baseCommit], { cwd: this.cwd, timeoutMs: 10_000 });
 	}
 
-	private async ensureCleanForGitRef() {
-		if (!this.config.gitRefRequireCleanWorktree) return;
+	private async ensureCleanHostTrackedFiles() {
 		const repoRoot = (await this.gitRepoRoot()) ?? this.cwd;
-		const result = await runChecked(
-			"git",
+		const result = await runGitChecked(
 			["status", "--porcelain", "--untracked-files=no", "--", "."],
 			{ cwd: repoRoot, timeoutMs: 30_000 },
 		);
-		const status = result.stdout.toString().trim();
-		if (status) {
-			throw new Error(
-				`Sandbox git-ref mode requires no tracked host changes before starting. Untracked files are handled by gitRefUntrackedMode. Commit/stash tracked changes first:\n${status}`,
-			);
+		if (result.stdout.toString().trim()) {
+			throw new Error("Cannot start sandbox. Commit or stash tracked changes before starting");
 		}
 	}
 
 	async preflight(ctx: ExtensionContext) {
 		this.preflightError = undefined;
-		if (!this.config.enabled) return;
+		if (!this.isEnabled()) return;
 		try {
 			const repoRoot = await this.gitRepoRoot();
 			if (!repoRoot) throw new Error("current directory is not inside a git repository");
 			const head = await this.gitHead();
 			if (!head) throw new Error("git repository has no commits yet (HEAD is unborn)");
-			await this.ensureCleanForGitRef();
+			await this.ensureCleanHostTrackedFiles();
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			this.preflightError = message;
@@ -727,24 +784,23 @@ class ContainerSandbox {
 			return;
 		}
 
-		await this.ensureCleanForGitRef();
+		await this.ensureCleanHostTrackedFiles();
 		await this.runtimeExecChecked(["exec", "-u", "root", this.containerName, "rm", "-rf", state.repoRoot]);
 		await this.runtimeExecChecked(["exec", "-u", "root", this.containerName, "mkdir", "-p", state.repoRoot, "/tmp/pi-home"]);
 		const temp = await mkdtemp(path.join(tmpdir(), "pi-sandbox-gitref-"));
 		try {
 			const cloneDir = path.join(temp, "repo");
 			const sourceUrl = this.localCloneSourceUrl(state.repoRoot);
-			const sandboxRefCommit = (await runChecked("git", ["rev-parse", "--verify", state.sandboxRef], { cwd: state.repoRoot, timeoutMs: 10_000 })).stdout
+			const sandboxRefCommit = (await runGitChecked(["rev-parse", "--verify", state.sandboxRef], { cwd: state.repoRoot, timeoutMs: 10_000 })).stdout
 				.toString()
 				.trim();
-			await runChecked("git", ["clone", "--no-tags", ...this.gitDepthArgs(), sourceUrl, cloneDir], {
+			await runGitChecked(["clone", "--no-tags", "--template=", ...this.gitDepthArgs(), sourceUrl, cloneDir], {
 				timeoutMs: 10 * 60 * 1000,
 			});
 			const hasSandboxRefCommit =
-				(await run("git", ["cat-file", "-e", `${sandboxRefCommit}^{commit}`], { cwd: cloneDir, timeoutMs: 10_000 })).code === 0;
+				(await runGit(["cat-file", "-e", `${sandboxRefCommit}^{commit}`], { cwd: cloneDir, timeoutMs: 10_000 })).code === 0;
 			if (!hasSandboxRefCommit) {
-				await runChecked(
-					"git",
+				await runGitChecked(
 					["fetch", "--no-tags", ...this.gitDepthArgs(), sourceUrl, `${state.sandboxRef}:refs/remotes/pi-sandbox/resume`],
 					{
 						cwd: cloneDir,
@@ -752,8 +808,8 @@ class ContainerSandbox {
 					},
 				);
 			}
-			await runChecked("git", ["switch", "-C", state.sandboxBranch, sandboxRefCommit], { cwd: cloneDir, timeoutMs: 60_000 });
-			await run("git", ["remote", "remove", "origin"], { cwd: cloneDir, timeoutMs: 10_000 }).catch(() => undefined);
+			await runGitChecked(["switch", "-C", state.sandboxBranch, sandboxRefCommit], { cwd: cloneDir, timeoutMs: 60_000 });
+			await runGit(["remote", "remove", "origin"], { cwd: cloneDir, timeoutMs: 10_000 }).catch(() => undefined);
 			// Future note: this is the seam where the sandbox backend can switch to jj.
 			// A colocated jj repo would run `jj git init --colocate` here, then each
 			// turn would describe/export changes before the host fetches Git commits.
@@ -800,9 +856,7 @@ class ContainerSandbox {
 
 	private async createContainer(ctx?: ExtensionContext) {
 		await this.ensureRuntime();
-		if (this.config.autoBuildImage) {
-			await buildDefaultImage(this.config.runtime, this.config.image, ctx);
-		}
+		await this.ensurePackageCacheVolume();
 
 		const state = await this.ensureGitRefState(ctx);
 		const targetName = state.containerName || `pi-sandbox-${process.pid}-${randomBytes(4).toString("hex")}`;
@@ -813,6 +867,7 @@ class ContainerSandbox {
 		if (await this.containerExists(targetName)) {
 			this.reusedContainer = true;
 			await this.runtimeExecChecked(["start", targetName]);
+			await this.initializePackageCacheDirectories();
 			await this.prepareGitRefWorkspace(ctx);
 			this.started = true;
 			ctx?.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", `sandbox: ${targetName} (reused)`));
@@ -828,11 +883,15 @@ class ContainerSandbox {
 			"HOME=/tmp/pi-home",
 			"-e",
 			"CI=1",
+			...Object.entries(PACKAGE_CACHE_ENV).flatMap(([key, value]) => ["-e", `${key}=${value}`]),
+			"-v",
+			`${PACKAGE_CACHE_VOLUME}:${PACKAGE_CACHE_ROOT}`,
 			this.config.image,
 			"sleep",
 			"infinity",
 		]);
 		await this.runtimeExecChecked(["start", targetName]);
+		await this.initializePackageCacheDirectories();
 		await this.prepareGitRefWorkspace(ctx);
 		this.started = true;
 		ctx?.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", `sandbox: ${targetName}`));
@@ -840,7 +899,7 @@ class ContainerSandbox {
 	}
 
 	async ensure(ctx?: ExtensionContext) {
-		if (!this.config.enabled) return;
+		if (!this.isEnabled()) return;
 		if (this.started) return;
 		if (!this.starting) {
 			this.starting = (async () => {
@@ -855,100 +914,31 @@ class ContainerSandbox {
 		await this.starting;
 	}
 
-	private async copyDependencyPaths(ctx?: ExtensionContext) {
-		const state = await this.ensureGitRefState(ctx);
-		const temp = await mkdtemp(path.join(tmpdir(), "pi-sandbox-deps-"));
-		let copied = 0;
-		const copiedPaths: string[] = [];
-		try {
-			for (const relativePath of this.config.installDepsCopyPaths) {
-				const cleaned = relativePath.trim();
-				if (!cleaned || path.isAbsolute(cleaned) || cleaned.startsWith("..")) continue;
-				const source = path.join(state.repoRoot, cleaned);
-				if (!existsSync(source)) continue;
-				const target = path.join(temp, cleaned);
-				await mkdir(path.dirname(target), { recursive: true });
-				await cp(source, target, { recursive: true, dereference: false, preserveTimestamps: true, force: true });
-				copiedPaths.push(cleaned);
-				copied++;
-			}
-			if (copied > 0) {
-				await this.copyDirectoryToContainer(temp, state.repoRoot);
-				const identity = (await this.runtimeExecChecked(["exec", this.containerName!, "sh", "-c", "printf '%s:%s' \"$(id -u)\" \"$(id -g)\""])).stdout
-					.toString()
-					.trim();
-				const owner = identity || "0:0";
-				// Tar archives include the source directory metadata. When copying a
-				// temp dir into the workspace, that can reset the workspace root to
-				// host uid/mode and make `ls .` fail for the container user.
-				await this.runtimeExecChecked(["exec", "-u", "root", this.containerName!, "chown", owner, state.repoRoot]);
-				await this.runtimeExecChecked(["exec", "-u", "root", this.containerName!, "chmod", "u+rwx", state.repoRoot]);
-				await this.runtimeExecChecked([
-					"exec",
-					"-u",
-					"root",
-					this.containerName!,
-					"chown",
-					"-R",
-					owner,
-					...copiedPaths.map((relativePath) => path.posix.join(toPosix(state.repoRoot), toPosix(relativePath))),
-				]);
-			}
-		} finally {
-			await rm(temp, { recursive: true, force: true });
-		}
-		ctx?.ui.notify(copied > 0 ? `Copied ${copied} dependency path(s) into sandbox` : "No configured dependency paths found on host to copy", "info");
-	}
-
 	private async installDependencies(ctx?: ExtensionContext) {
 		if (this.depsInstalled || !this.containerName) return;
 		this.depsInstalled = true;
-		if (this.config.installDeps === "copy") {
-			await this.copyDependencyPaths(ctx);
-			return;
-		}
 		ctx?.ui.notify("Sandbox dependency bootstrap started", "info");
 		const script = `set -e
 if [ -f package-lock.json ]; then
   npm ci
 elif [ -f pnpm-lock.yaml ]; then
   corepack enable && pnpm install --frozen-lockfile
+elif [ -f bun.lock ] || [ -f bun.lockb ]; then
+  bun install --frozen-lockfile
 elif [ -f yarn.lock ]; then
   corepack enable && yarn install --frozen-lockfile
 elif [ -f package.json ]; then
   npm install
 fi
-if [ -f requirements.txt ]; then
+if [ -f uv.lock ]; then
+  uv sync --frozen
+elif [ -f requirements.txt ]; then
   python3 -m pip install -r requirements.txt || python3 -m pip install --break-system-packages -r requirements.txt
 fi
 `;
 		const result = await this.execShell(script, this.cwd, { timeout: 20 * 60, onData: () => {} });
 		if (result.exitCode === 0) ctx?.ui.notify("Sandbox dependency bootstrap finished", "info");
 		else ctx?.ui.notify(`Sandbox dependency bootstrap exited with ${result.exitCode}`, "warning");
-	}
-
-	private shellCommand(command: string): { env: string[]; command: string } {
-		if (this.config.mise === "never") return { env: [], command };
-		const encoded = Buffer.from(command, "utf8").toString("base64");
-		return {
-			env: [`PI_SANDBOX_COMMAND_B64=${encoded}`],
-			command: `set -e
-cmd=$(printf '%s' "$PI_SANDBOX_COMMAND_B64" | base64 -d)
-has_mise_config=0
-dir=$PWD
-while :; do
-  if [ -f "$dir/.mise.toml" ] || [ -f "$dir/mise.toml" ] || [ -f "$dir/.tool-versions" ]; then
-    has_mise_config=1
-    break
-  fi
-  [ "$dir" = "/" ] && break
-  dir=$(dirname "$dir")
-done
-if [ "$has_mise_config" = "1" ] && command -v mise >/dev/null 2>&1; then
-  exec mise exec -- bash -lc "$cmd"
-fi
-exec bash -lc "$cmd"`,
-		};
 	}
 
 	async execShell(
@@ -958,18 +948,16 @@ exec bash -lc "$cmd"`,
 	): Promise<{ exitCode: number | null }> {
 		await this.ensure();
 		if (!this.containerName) throw new Error("Sandbox container is not running");
-		const shell = this.shellCommand(command);
 		const args = [
 			"exec",
 			"-i",
 			"-w",
 			cwd,
 			...this.envArgs(),
-			...shell.env.flatMap((value) => ["-e", value]),
 			this.containerName,
 			"bash",
 			"-lc",
-			shell.command,
+			command,
 		];
 		const result = await this.runtimeExec(args, {
 			signal: options.signal,
@@ -993,35 +981,25 @@ exec bash -lc "$cmd"`,
 		return this.runtimeExec([...execArgs, ...args], options);
 	}
 
-	private resolveContainerPath(inputPath: string): string {
-		const cleaned = inputPath.trim();
-		if (!cleaned) return this.cwd;
-		return path.posix.isAbsolute(cleaned) ? path.posix.normalize(cleaned) : path.posix.resolve(toPosix(this.cwd), toPosix(cleaned));
-	}
-
-	private resolveHostPath(inputPath: string): string {
-		const cleaned = inputPath.trim();
-		if (!cleaned) return this.cwd;
-		return path.isAbsolute(cleaned) ? path.resolve(cleaned) : path.resolve(this.cwd, cleaned);
-	}
-
-	async copyOut(containerPath: string, hostPath: string | undefined, ctx?: ExtensionContext): Promise<string> {
-		await this.ensure(ctx);
-		if (!this.containerName) throw new Error("Sandbox container is not running");
-		const source = this.resolveContainerPath(containerPath);
-		const destination = this.resolveHostPath(hostPath || containerPath);
-		await mkdir(path.dirname(destination), { recursive: true });
-		await this.runtimeExecChecked(["cp", `${this.containerName}:${source}`, destination], { timeoutMs: 10 * 60 * 1000 });
-		return `Copied ${this.containerName}:${source} to ${destination}`;
-	}
-
 	private gitPathspec(paths?: string[]): string[] {
 		return paths && paths.length > 0 ? paths : ["."];
 	}
 
+	private async unstageCopiedHostFiles(state: GitRefState, expectedParent: string) {
+		const metadataPath = path.posix.join(toPosix(state.repoRoot), ".git/info/pi-sandbox-host-untracked");
+		if ((await this.execCode(["test", "-s", metadataPath], { timeoutMs: 10_000 })).code !== 0) return;
+		await this.containerGitChecked([
+			"reset",
+			"-q",
+			expectedParent,
+			`--pathspec-from-file=${metadataPath}`,
+			"--pathspec-file-nul",
+		], { timeoutMs: 60_000 });
+	}
+
 	private autoCommitMessage(): string {
 		const timestamp = new Date().toISOString().replace(/T/, " ").replace(/\.\d+Z$/, " UTC");
-		return this.withCommitCoAuthor(`${this.config.gitCommitMessagePrefix}: ${timestamp}`);
+		return this.withCommitCoAuthor(`${FALLBACK_COMMIT_PREFIX}: ${timestamp}`);
 	}
 
 	private withCommitCoAuthor(message: string): string {
@@ -1049,11 +1027,11 @@ exec bash -lc "$cmd"`,
 		return this.withCommitCoAuthor(cleaned || this.autoCommitMessage());
 	}
 
-	private async stagedDiffForCommitMessage(pathspec: string[]): Promise<string> {
+	private async stagedDiffForCommitMessage(pathspec: string[], expectedParent: string): Promise<string> {
 		const [nameStatus, stat, diff] = await Promise.all([
-			this.containerGitChecked(["diff", "--cached", "--name-status", "--", ...pathspec], { timeoutMs: 60_000 }),
-			this.containerGitChecked(["diff", "--cached", "--stat", "--", ...pathspec], { timeoutMs: 60_000 }),
-			this.containerGitChecked(["diff", "--cached", "--no-ext-diff", "--unified=3", "--", ...pathspec], { timeoutMs: 120_000 }),
+			this.containerGitChecked(["diff", "--cached", "--name-status", expectedParent, "--", ...pathspec], { timeoutMs: 60_000 }),
+			this.containerGitChecked(["diff", "--cached", "--stat", expectedParent, "--", ...pathspec], { timeoutMs: 60_000 }),
+			this.containerGitChecked(["diff", "--cached", "--no-ext-diff", "--unified=3", expectedParent, "--", ...pathspec], { timeoutMs: 120_000 }),
 		]);
 		const raw = [
 			"Changed files:",
@@ -1069,11 +1047,11 @@ exec bash -lc "$cmd"`,
 		return truncation.truncated ? `${truncation.content}\n\n[Diff truncated at ${formatSize(this.config.gitCommitAiMaxDiffBytes)}]` : truncation.content;
 	}
 
-	private async generateCommitMessage(ctx: ExtensionContext | undefined, pathspec: string[]): Promise<string | undefined> {
-		if (this.config.gitCommitMessageMode !== "ai" || !ctx?.model) return undefined;
+	private async generateCommitMessage(ctx: ExtensionContext | undefined, pathspec: string[], expectedParent: string): Promise<string | undefined> {
+		if (!ctx?.model) return undefined;
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
 		if (!auth.ok) throw new Error(auth.error);
-		const diffText = await this.stagedDiffForCommitMessage(pathspec);
+		const diffText = await this.stagedDiffForCommitMessage(pathspec, expectedParent);
 		const coAuthor = this.config.gitCommitCoAuthor.trim();
 		const trailerRule = coAuthor ? `- End with exactly this trailer line: Co-authored-by: ${coAuthor}` : "- Do not include co-author trailers.";
 		const stream = streamSimple(
@@ -1121,64 +1099,6 @@ exec bash -lc "$cmd"`,
 		return content ? this.sanitizeCommitMessage(content) : undefined;
 	}
 
-	private validateHostGitArgs(args: string[]): string | undefined {
-		if (args.length === 0) return "host_git requires at least one git argument, for example ['status', '--short'].";
-		const command = args[0];
-		if (!command || command.startsWith("-")) return "host_git requires the first argument to be a git subcommand, not a flag.";
-		if (!this.config.gitHostAllowedCommands.includes(command)) {
-			return `git ${command} is not allowed on the host. Allowed commands: ${this.config.gitHostAllowedCommands.join(", ")}`;
-		}
-		const blocked = args.find((arg) => {
-			return (
-				arg === "--output" ||
-				arg.startsWith("--output=") ||
-				arg === "--ext-diff" ||
-				arg === "--textconv" ||
-				arg === "-O" ||
-				arg === "--open-files-in-pager"
-			);
-		});
-		if (blocked) return `host_git blocked unsafe/read-write git option: ${blocked}`;
-		return undefined;
-	}
-
-	async runHostGit(args: string[]): Promise<{ content: TextContent[]; details: Record<string, unknown> }> {
-		if (!this.config.gitHostTool) {
-			return { content: text("host_git is disabled by sandbox config."), details: { disabled: true } };
-		}
-		const validationError = this.validateHostGitArgs(args);
-		if (validationError) return { content: text(validationError), details: { blocked: true } };
-
-		const command = args[0];
-		const rest = args.slice(1);
-		const safeArgs = [
-			"--no-pager",
-			"-c",
-			"core.pager=cat",
-			"-c",
-			"core.fsmonitor=false",
-			"-c",
-			"core.hooksPath=/dev/null",
-			command,
-		];
-		if (command === "diff" || command === "log" || command === "show") safeArgs.push("--no-ext-diff");
-		safeArgs.push(...rest);
-
-		const result = await run("git", safeArgs, {
-			cwd: this.cwd,
-			timeoutMs: 120_000,
-		});
-		const rawOutput = [result.stdout.toString(), result.stderr.toString()].filter(Boolean).join("\n");
-		const truncation = truncateHead(rawOutput || `(git exited with code ${result.code})`, { maxLines: Number.MAX_SAFE_INTEGER });
-		let output = truncation.content;
-		const details: Record<string, unknown> = { exitCode: result.code, args: safeArgs };
-		if (truncation.truncated) {
-			details.truncation = truncation;
-			output += `\n\n[Output truncated at ${formatSize(DEFAULT_MAX_BYTES)}]`;
-		}
-		return { content: text(output), details };
-	}
-
 	private async containerGit(args: string[], options: ExecOptions = {}) {
 		await this.ensure();
 		if (!this.containerName) throw new Error("Sandbox container is not running");
@@ -1194,68 +1114,114 @@ exec bash -lc "$cmd"`,
 		return result;
 	}
 
-	private async importSandboxHeadToHost(state: GitRefState): Promise<{ imported: boolean; commitHash: string }> {
-		if (!this.containerName) throw new Error("Sandbox container is not running");
+	private async hostSandboxHead(state: GitRefState): Promise<string> {
 		await this.ensureHostSandboxRef(state);
-		const hostBase = (await runChecked("git", ["rev-parse", "--verify", state.sandboxRef], { cwd: this.cwd, timeoutMs: 10_000 })).stdout
+		return (await runGitChecked(["rev-parse", "--verify", `${state.sandboxRef}^{commit}`], { cwd: state.repoRoot, timeoutMs: 10_000 })).stdout
 			.toString()
 			.trim();
-		const sandboxHead = (await this.containerGitChecked(["rev-parse", "HEAD"], { timeoutMs: 10_000 })).stdout.toString().trim();
-		if (sandboxHead === hostBase) return { imported: false, commitHash: sandboxHead.slice(0, 12) };
+	}
 
-		const bundlePath = `/tmp/pi-sandbox-${state.sessionKey}.bundle`;
-		await this.containerGitChecked(["bundle", "create", bundlePath, "HEAD", `^${hostBase}`], { timeoutMs: 5 * 60 * 1000 });
+	private async importSandboxHeadToHost(state: GitRefState, expectedParent: string): Promise<{ imported: boolean; commitHash: string }> {
+		if (!this.containerName) throw new Error("Sandbox container is not running");
+		const sandboxHead = (await this.containerGitChecked(["rev-parse", "--verify", "HEAD^{commit}"], { timeoutMs: 10_000 })).stdout
+			.toString()
+			.trim();
+		if (sandboxHead === expectedParent) return { imported: false, commitHash: sandboxHead.slice(0, 12) };
+
+		const nonce = randomBytes(16).toString("hex");
+		const bundlePath = `/tmp/pi-sandbox-${state.sessionKey}-${nonce}.bundle`;
+		const importRef = `refs/pi-sandbox-import/${state.sessionKey}/${nonce}`;
+		await this.containerGitChecked(["bundle", "create", bundlePath, "HEAD", `^${expectedParent}`], { timeoutMs: 5 * 60 * 1000 });
 		const temp = await mkdtemp(path.join(tmpdir(), "pi-sandbox-bundle-"));
 		const hostBundle = path.join(temp, "sandbox.bundle");
+		let importedHead: string | undefined;
 		try {
 			await this.runtimeExecChecked(["cp", `${this.containerName}:${bundlePath}`, hostBundle], { timeoutMs: 5 * 60 * 1000 });
-			await runChecked("git", ["fetch", hostBundle, `+HEAD:${state.sandboxRef}`], { cwd: this.cwd, timeoutMs: 5 * 60 * 1000 });
+			await runGitChecked(["fetch", "--no-write-fetch-head", hostBundle, `+HEAD:${importRef}`], {
+				cwd: state.repoRoot,
+				timeoutMs: 5 * 60 * 1000,
+			});
+			importedHead = (await runGitChecked(["rev-parse", "--verify", `${importRef}^{commit}`], { cwd: state.repoRoot, timeoutMs: 10_000 })).stdout
+				.toString()
+				.trim();
+			if (importedHead !== sandboxHead) throw new Error("Imported checkpoint does not match the sandbox HEAD");
+
+			await runGitChecked(["fsck", "--strict", "--no-reflogs", importedHead], { cwd: state.repoRoot, timeoutMs: 5 * 60 * 1000 });
+			const importedParent = (await runGitChecked(["rev-parse", "--verify", `${importedHead}^`], { cwd: state.repoRoot, timeoutMs: 10_000 })).stdout
+				.toString()
+				.trim();
+			if (importedParent !== expectedParent) {
+				throw new Error(`Refusing non-linear sandbox checkpoint: expected parent ${expectedParent}, got ${importedParent}`);
+			}
+			const commitCount = (await runGitChecked(["rev-list", "--count", `${expectedParent}..${importedHead}`], {
+				cwd: state.repoRoot,
+				timeoutMs: 30_000,
+			})).stdout.toString().trim();
+			if (commitCount !== "1") throw new Error(`Refusing sandbox checkpoint containing ${commitCount} commits; expected exactly 1`);
+
+			// Compare-and-swap prevents concurrent sessions sharing a ref from
+			// silently overwriting one another.
+			await runGitChecked(["update-ref", state.sandboxRef, importedHead, expectedParent], { cwd: state.repoRoot, timeoutMs: 30_000 });
 		} finally {
+			await runGit(["update-ref", "-d", importRef], { cwd: state.repoRoot, timeoutMs: 30_000 }).catch(() => undefined);
 			await rm(temp, { recursive: true, force: true });
 			await this.runtimeExec(["exec", this.containerName, "rm", "-f", bundlePath]).catch(() => undefined);
 		}
 		return { imported: true, commitHash: sandboxHead.slice(0, 12) };
 	}
 
-	async checkpointGitRef(message?: string, ctx?: ExtensionContext, paths?: string[]): Promise<GitRefCheckpointResult> {
+	private async checkpointGitRefUnlocked(message?: string, ctx?: ExtensionContext, paths?: string[]): Promise<GitRefCheckpointResult> {
+		if (!this.isEnabled()) throw new Error("Sandbox is disabled by --no-sandbox");
+		if (this.pendingRebase) throw new Error("Sandbox rebase is pending; complete or abort it before checkpointing");
 		await this.ensure(ctx);
 		const state = await this.ensureGitRefState(ctx);
+		const expectedParent = await this.hostSandboxHead(state);
 		const pathspec = this.gitPathspec(paths);
-		const status = (await this.containerGitChecked(["status", "--porcelain", "--untracked-files=all", "--", ...pathspec], { timeoutMs: 30_000 })).stdout
-			.toString()
-			.trim();
 		let committed = false;
 		let commitMessage = message?.trim();
-		if (status) {
-			await this.containerGitChecked(["add", "-A", "--", ...pathspec], { timeoutMs: 60_000 });
-			const hasStaged = (await this.containerGit(["diff", "--cached", "--quiet", "--exit-code"], { timeoutMs: 60_000 })).code !== 0;
-			if (hasStaged) {
-				if (!commitMessage) {
-					try {
-						commitMessage = await this.generateCommitMessage(ctx, pathspec);
-					} catch (error) {
-						const reason = error instanceof Error ? error.message : String(error);
-						ctx?.ui.notify(`AI commit message generation failed; using fallback: ${reason}`, "warning");
-					}
+
+		// Rebuild the checkpoint from the index and the authoritative host
+		// parent. This deliberately ignores any commits or history rewrites the
+		// agent may have created with unrestricted Git commands in the container.
+		await this.containerGitChecked(["add", "-A", "--", ...pathspec], { timeoutMs: 60_000 });
+		await this.unstageCopiedHostFiles(state, expectedParent);
+		const hasStaged = (await this.containerGit(["diff", "--cached", "--quiet", "--exit-code", expectedParent, "--", ...pathspec], { timeoutMs: 60_000 })).code !== 0;
+		if (hasStaged) {
+			if (!commitMessage) {
+				try {
+					commitMessage = await this.generateCommitMessage(ctx, pathspec, expectedParent);
+				} catch (error) {
+					const reason = error instanceof Error ? error.message : String(error);
+					ctx?.ui.notify(`AI commit message generation failed; using fallback: ${reason}`, "warning");
 				}
-				commitMessage = this.sanitizeCommitMessage(commitMessage || this.autoCommitMessage());
-				const commitArgs = [
+			}
+			commitMessage = this.sanitizeCommitMessage(commitMessage || this.autoCommitMessage());
+			const tree = (await this.containerGitChecked(["write-tree"], { timeoutMs: 60_000 })).stdout.toString().trim();
+			const commit = (await this.containerGitChecked(
+				[
 					"-c",
 					"user.name=pi sandbox",
 					"-c",
 					"user.email=pi-sandbox@localhost",
 					"-c",
 					"commit.gpgsign=false",
-					"commit",
-				];
-				if (this.config.gitCommitNoVerify) commitArgs.push("--no-verify");
-				if (this.config.gitCommitNoGpgSign) commitArgs.push("--no-gpg-sign");
-				commitArgs.push("-m", commitMessage);
-				await this.containerGitChecked(commitArgs, { timeoutMs: 120_000 });
-				committed = true;
-			}
+					"commit-tree",
+					tree,
+					"-p",
+					expectedParent,
+					"-F",
+					"-",
+				],
+				{ input: commitMessage, timeoutMs: 120_000 },
+			)).stdout.toString().trim();
+			await this.containerGitChecked(["update-ref", "HEAD", commit], { timeoutMs: 30_000 });
+			committed = true;
+		} else {
+			// Discard container-only empty commits or rewritten history. There is
+			// no tree change to import for this checkpoint.
+			await this.containerGitChecked(["update-ref", "HEAD", expectedParent], { timeoutMs: 30_000 });
 		}
-		const imported = await this.importSandboxHeadToHost(state);
+		const imported = await this.importSandboxHeadToHost(state, expectedParent);
 		return {
 			committed,
 			imported: imported.imported,
@@ -1265,25 +1231,272 @@ exec bash -lc "$cmd"`,
 		};
 	}
 
-	async checkpointSandboxChanges(params: { message?: string; paths?: string[] }, ctx?: ExtensionContext): Promise<GitCommitResult> {
-		const result = await this.checkpointGitRef(params.message, ctx, params.paths);
+	async checkpointGitRef(message?: string, ctx?: ExtensionContext, paths?: string[]): Promise<GitRefCheckpointResult> {
+		const operation = this.checkpointTail.then(() => this.checkpointGitRefUnlocked(message, ctx, paths));
+		this.checkpointTail = operation.catch(() => undefined);
+		return operation;
+	}
+
+	private setPendingRebase(pending: PendingRebase | undefined) {
+		this.pendingRebase = pending;
+		this.pi.appendEntry("container-sandbox.rebase-state", pending ? { active: true, pending } : { active: false });
+	}
+
+	private async containerRebaseInProgress(): Promise<boolean> {
+		const result = await this.execCode([
+			"sh",
+			"-c",
+			'cd "$1" && { test -d "$(git rev-parse --git-path rebase-merge)" || test -d "$(git rev-parse --git-path rebase-apply)"; }',
+			"sh",
+			this.cwd,
+		], { timeoutMs: 10_000 });
+		return result.code === 0;
+	}
+
+	private async rebaseConflictFiles(): Promise<string[]> {
+		const result = await this.containerGit(["diff", "--name-only", "--diff-filter=U"], { timeoutMs: 30_000 });
+		return result.stdout.toString().split("\n").map((value) => value.trim()).filter(Boolean);
+	}
+
+	private async containerTrackedStatus(): Promise<string> {
+		return (await this.containerGitChecked(["status", "--porcelain", "--untracked-files=no"], { timeoutMs: 30_000 })).stdout
+			.toString()
+			.trim();
+	}
+
+	private async transferHostBaseToContainer(state: GitRefState, baseRef: string, newBase: string, containerBaseRef: string) {
+		if (!this.containerName) throw new Error("Sandbox container is not running");
+		const temp = await mkdtemp(path.join(tmpdir(), "pi-sandbox-base-"));
+		const hostBundle = path.join(temp, "base.bundle");
+		const containerBundle = `/tmp/pi-sandbox-base-${state.sessionKey}-${randomBytes(8).toString("hex")}.bundle`;
+		try {
+			await runGitChecked(["bundle", "create", hostBundle, baseRef], { cwd: state.repoRoot, timeoutMs: 5 * 60 * 1000 });
+			await this.runtimeExecChecked(["cp", hostBundle, `${this.containerName}:${containerBundle}`], { timeoutMs: 5 * 60 * 1000 });
+			await this.containerGitChecked(["fetch", "--no-tags", containerBundle, `+${baseRef}:${containerBaseRef}`], {
+				timeoutMs: 5 * 60 * 1000,
+			});
+			await this.containerGitChecked(["cat-file", "-e", `${newBase}^{commit}`], { timeoutMs: 30_000 });
+		} finally {
+			await rm(temp, { recursive: true, force: true });
+			await this.runtimeExec(["exec", this.containerName, "rm", "-f", containerBundle]).catch(() => undefined);
+		}
+	}
+
+	private async completeRebaseState(state: GitRefState, pending: PendingRebase) {
+		state.baseCommit = pending.newBase;
+		this.pi.appendEntry("container-sandbox.git-ref-state", state);
+		await this.containerGit(["update-ref", "-d", pending.containerBaseRef]).catch(() => undefined);
+		this.setPendingRebase(undefined);
+	}
+
+	async rebaseHost(ctx?: ExtensionContext): Promise<RebaseResult> {
+		await this.ensure(ctx);
+		if (this.pendingRebase) return this.rebaseStatus();
+
+		// Capture all current work before selecting the old sandbox tip.
+		await this.checkpointGitRef(undefined, ctx);
+		const state = await this.ensureGitRefState(ctx);
+		const baseRef = `refs/heads/${state.baseBranch}`;
+		const baseExists = (await runGit(["show-ref", "--verify", "--quiet", baseRef], { cwd: state.repoRoot, timeoutMs: 10_000 })).code === 0;
+		if (!baseExists) throw new Error(`Cannot rebase sandbox: host base branch does not exist: ${baseRef}`);
+
+		const oldSandboxTip = await this.hostSandboxHead(state);
+		const newBase = (await runGitChecked(["rev-parse", "--verify", `${baseRef}^{commit}`], { cwd: state.repoRoot, timeoutMs: 10_000 })).stdout
+			.toString()
+			.trim();
+		const recordedBaseOnSandbox = (await runGit(["merge-base", "--is-ancestor", state.baseCommit, oldSandboxTip], {
+			cwd: state.repoRoot,
+			timeoutMs: 30_000,
+		})).code === 0;
+		const recordedBaseOnHost = (await runGit(["merge-base", "--is-ancestor", state.baseCommit, newBase], {
+			cwd: state.repoRoot,
+			timeoutMs: 30_000,
+		})).code === 0;
+		if (recordedBaseOnSandbox && !recordedBaseOnHost) {
+			throw new Error("Cannot automatically rebase after a non-fast-forward update of the host base branch");
+		}
+		let oldBase = state.baseCommit;
+		if (!recordedBaseOnSandbox) {
+			// A stable --sandbox-name can be resumed in a new Pi session without
+			// the original session metadata. Recover its base from graph ancestry.
+			oldBase = (await runGitChecked(["merge-base", oldSandboxTip, newBase], { cwd: state.repoRoot, timeoutMs: 30_000 })).stdout
+				.toString()
+				.trim();
+		}
+		if (!oldBase) throw new Error("Cannot determine a common base for the sandbox and host branch");
+		if (newBase === oldBase) return { completed: true, conflicted: false, message: `Sandbox is already based on ${state.baseBranch} @ ${newBase.slice(0, 12)}` };
+		const expectedCommitCount = Number((await runGitChecked(["rev-list", "--count", `${oldBase}..${oldSandboxTip}`], {
+			cwd: state.repoRoot,
+			timeoutMs: 30_000,
+		})).stdout.toString().trim());
+		if (!Number.isSafeInteger(expectedCommitCount) || expectedCommitCount < 0) throw new Error("Could not determine sandbox commit count");
+
+		const containerBaseRef = `refs/pi-sandbox-base/${state.sessionKey}/${newBase.slice(0, 16)}`;
+		await this.transferHostBaseToContainer(state, baseRef, newBase, containerBaseRef);
+		await this.containerGitChecked(["switch", "-C", state.sandboxBranch, oldSandboxTip], { timeoutMs: 60_000 });
+
+		const pending: PendingRebase = {
+			oldBase,
+			newBase,
+			oldSandboxTip,
+			expectedCommitCount,
+			containerBaseRef,
+			startedAt: new Date().toISOString(),
+		};
+		this.setPendingRebase(pending);
+		ctx?.ui.setStatus("sandbox-rebase", ctx.ui.theme.fg("warning", `rebase: ${state.baseBranch}`));
+
+		if (expectedCommitCount === 0) {
+			await this.containerGitChecked(["reset", "--hard", newBase], { timeoutMs: 60_000 });
+			return this.finalizePendingRebase(ctx);
+		}
+
+		const result = await this.containerGit(
+			[
+				"-c", "core.hooksPath=/dev/null",
+				"-c", "commit.gpgsign=false",
+				"-c", "core.editor=true",
+				"-c", "sequence.editor=true",
+				"-c", "rerere.enabled=true",
+				"rebase",
+				"--reapply-cherry-picks",
+				"--empty=keep",
+				"--onto", newBase,
+				oldBase,
+			],
+			{ timeoutMs: 20 * 60 * 1000 },
+		);
+		if (result.code === 0) return this.finalizePendingRebase(ctx);
+		if (await this.containerRebaseInProgress()) {
+			const conflictFiles = await this.rebaseConflictFiles();
+			return {
+				completed: false,
+				conflicted: true,
+				message: `Rebase paused with ${conflictFiles.length} conflicted file(s). The agent will resolve them inside the container.`,
+				conflictFiles,
+			};
+		}
+
+		await this.abortRebase(ctx);
+		throw new Error(result.stderr.toString().trim() || result.stdout.toString().trim() || "Container rebase failed");
+	}
+
+	async finalizePendingRebase(ctx?: ExtensionContext): Promise<RebaseResult> {
+		const pending = this.pendingRebase;
+		if (!pending) return { completed: true, conflicted: false, message: "No sandbox rebase is pending" };
+		await this.ensure(ctx);
+		if (await this.containerRebaseInProgress()) {
+			const conflictFiles = await this.rebaseConflictFiles();
+			return { completed: false, conflicted: true, message: "Sandbox rebase still has unresolved conflicts", conflictFiles };
+		}
+		const trackedStatus = await this.containerTrackedStatus();
+		if (trackedStatus) {
+			return { completed: false, conflicted: false, message: `Rebase completed but tracked changes remain; refusing host import:\n${trackedStatus}` };
+		}
+
+		const state = await this.ensureGitRefState(ctx);
+		const sandboxHead = (await this.containerGitChecked(["rev-parse", "--verify", "HEAD^{commit}"], { timeoutMs: 10_000 })).stdout
+			.toString()
+			.trim();
+		if ((await this.containerGit(["merge-base", "--is-ancestor", pending.newBase, sandboxHead], { timeoutMs: 30_000 })).code !== 0) {
+			throw new Error("Rebased sandbox tip does not descend from the new host base");
+		}
+		const containerCount = (await this.containerGitChecked(["rev-list", "--count", `${pending.newBase}..${sandboxHead}`], { timeoutMs: 30_000 })).stdout
+			.toString()
+			.trim();
+		if (containerCount !== String(pending.expectedCommitCount)) {
+			throw new Error(`Rebased commit count changed: expected ${pending.expectedCommitCount}, got ${containerCount}`);
+		}
+
+		if (pending.expectedCommitCount === 0) {
+			await runGitChecked(["update-ref", state.sandboxRef, pending.newBase, pending.oldSandboxTip], { cwd: state.repoRoot, timeoutMs: 30_000 });
+			await this.completeRebaseState(state, pending);
+			ctx?.ui.setStatus("sandbox-rebase", undefined);
+			return { completed: true, conflicted: false, message: `Rebased ${state.sandboxRef} onto ${state.baseBranch} @ ${pending.newBase.slice(0, 12)}` };
+		}
+
+		const nonce = randomBytes(16).toString("hex");
+		const bundlePath = `/tmp/pi-sandbox-rebase-${state.sessionKey}-${nonce}.bundle`;
+		const importRef = `refs/pi-sandbox-import/${state.sessionKey}/rebase-${nonce}`;
+		await this.containerGitChecked(["bundle", "create", bundlePath, "HEAD", `^${pending.newBase}`], { timeoutMs: 5 * 60 * 1000 });
+		const temp = await mkdtemp(path.join(tmpdir(), "pi-sandbox-rebase-"));
+		const hostBundle = path.join(temp, "rebase.bundle");
+		let importedHead: string | undefined;
+		try {
+			await this.runtimeExecChecked(["cp", `${this.containerName}:${bundlePath}`, hostBundle], { timeoutMs: 5 * 60 * 1000 });
+			await runGitChecked(["fetch", "--no-write-fetch-head", hostBundle, `+HEAD:${importRef}`], { cwd: state.repoRoot, timeoutMs: 5 * 60 * 1000 });
+			importedHead = (await runGitChecked(["rev-parse", "--verify", `${importRef}^{commit}`], { cwd: state.repoRoot, timeoutMs: 10_000 })).stdout
+				.toString()
+				.trim();
+			if (importedHead !== sandboxHead) throw new Error("Imported rebased tip does not match the container tip");
+			await runGitChecked(["fsck", "--strict", "--no-reflogs", importedHead], { cwd: state.repoRoot, timeoutMs: 5 * 60 * 1000 });
+			if ((await runGit(["merge-base", "--is-ancestor", pending.newBase, importedHead], { cwd: state.repoRoot, timeoutMs: 30_000 })).code !== 0) {
+				throw new Error("Imported rebased history does not descend from the new base");
+			}
+			const importedCount = (await runGitChecked(["rev-list", "--count", `${pending.newBase}..${importedHead}`], { cwd: state.repoRoot, timeoutMs: 30_000 })).stdout
+				.toString()
+				.trim();
+			if (importedCount !== String(pending.expectedCommitCount)) throw new Error(`Imported rebase has ${importedCount} commits; expected ${pending.expectedCommitCount}`);
+			const mergeCount = (await runGitChecked(["rev-list", "--count", "--merges", `${pending.newBase}..${importedHead}`], { cwd: state.repoRoot, timeoutMs: 30_000 })).stdout
+				.toString()
+				.trim();
+			if (mergeCount !== "0") throw new Error("Imported rebased history contains unexpected merge commits");
+			await runGitChecked(["update-ref", state.sandboxRef, importedHead, pending.oldSandboxTip], { cwd: state.repoRoot, timeoutMs: 30_000 });
+		} finally {
+			await runGit(["update-ref", "-d", importRef], { cwd: state.repoRoot, timeoutMs: 30_000 }).catch(() => undefined);
+			await rm(temp, { recursive: true, force: true });
+			if (this.containerName) await this.runtimeExec(["exec", this.containerName, "rm", "-f", bundlePath]).catch(() => undefined);
+		}
+
+		await this.completeRebaseState(state, pending);
+		ctx?.ui.setStatus("sandbox-rebase", undefined);
+		return { completed: true, conflicted: false, message: `Rebased ${pending.expectedCommitCount} commit(s) onto ${state.baseBranch} @ ${pending.newBase.slice(0, 12)}` };
+	}
+
+	async rebaseStatus(): Promise<RebaseResult> {
+		const pending = this.pendingRebase;
+		if (!pending) return { completed: true, conflicted: false, message: "No sandbox rebase is pending" };
+		await this.ensure();
+		const conflicted = await this.containerRebaseInProgress();
+		const conflictFiles = conflicted ? await this.rebaseConflictFiles() : [];
 		return {
-			committed: result.committed || result.imported,
-			message: result.message,
-			commitHash: result.commitHash,
-			sandboxRef: result.sandboxRef,
+			completed: false,
+			conflicted,
+			message: [
+				`Rebase started: ${pending.startedAt}`,
+				`Old base: ${pending.oldBase}`,
+				`New base: ${pending.newBase}`,
+				`Original sandbox tip: ${pending.oldSandboxTip}`,
+				`Expected commits: ${pending.expectedCommitCount}`,
+				`Conflicts: ${conflictFiles.length}`,
+			].join("\n"),
+			conflictFiles,
 		};
 	}
 
+	async abortRebase(ctx?: ExtensionContext): Promise<string> {
+		const pending = this.pendingRebase;
+		if (!pending) return "No sandbox rebase is pending";
+		await this.ensure(ctx);
+		if (await this.containerRebaseInProgress()) {
+			await this.containerGit(["-c", "core.hooksPath=/dev/null", "rebase", "--abort"], { timeoutMs: 120_000 }).catch(() => undefined);
+		}
+		await this.containerGitChecked(["reset", "--hard", pending.oldSandboxTip], { timeoutMs: 120_000 });
+		await this.containerGit(["update-ref", "-d", pending.containerBaseRef]).catch(() => undefined);
+		this.setPendingRebase(undefined);
+		ctx?.ui.setStatus("sandbox-rebase", undefined);
+		return `Aborted sandbox rebase; restored ${pending.oldSandboxTip.slice(0, 12)}`;
+	}
+
 	async autoCheckpointSandboxChanges(ctx?: ExtensionContext) {
-		if (!this.config.gitAutoCommit) return;
+		if (!this.isEnabled() || this.pendingRebase) return;
 		const result = await this.checkpointGitRef(undefined, ctx);
 		if (result.committed || result.imported) ctx?.ui.notify(result.message, "info");
 	}
 
 
 	async checkpoint(ctx?: ExtensionContext) {
-		await this.checkpointGitRef(undefined, ctx);
+		return this.checkpointGitRef(undefined, ctx);
 	}
 
 	async shutdown(ctx?: ExtensionContext) {
@@ -1293,13 +1506,13 @@ exec bash -lc "$cmd"`,
 			// checkpointGitRef() calls ensure(), and on a resume/session
 			// switch that would create a throwaway container for the session being
 			// left, producing two containers for one visible resume.
-			if (this.config.gitAutoCommit && this.started && this.containerName) await this.autoCheckpointSandboxChanges(ctx);
+			if (this.started && this.containerName) await this.autoCheckpointSandboxChanges(ctx);
 		} finally {
 			if (containerToCleanup) {
-				if (!this.config.keep && !this.reusedContainer) {
+				if (this.config.autoRemove) {
 					await this.runtimeExec(["rm", "-f", containerToCleanup]).catch(() => undefined);
 				} else {
-					// Keep the container filesystem for reuse, but do not leave old
+					// Preserve the container filesystem for reuse, but do not leave old
 					// sessions consuming resources after resume/fork/new/quit.
 					await this.runtimeExec(["stop", containerToCleanup]).catch(() => undefined);
 				}
@@ -1323,53 +1536,17 @@ const grepSchema = Type.Object({
 	limit: Type.Optional(Type.Number({ description: "Maximum number of matches to return (default: 100)" })),
 });
 
-const gitCommitSchema = Type.Object({
-	message: Type.Optional(Type.String({ description: "Git commit message for the sandbox checkpoint. If omitted, Pi generates one from the staged diff." })),
-	paths: Type.Optional(Type.Array(Type.String(), { description: "Optional sandbox paths to stage. Defaults to the project." })),
-});
-
-const hostGitSchema = Type.Object({
-	args: Type.Array(Type.String(), {
-		description:
-			"Arguments to pass to git on the host, excluding the leading 'git'. First argument must be an allowed read-only subcommand such as status, diff, log, show, rev-parse, ls-files, grep, or describe.",
-	}),
-});
-
 export default function (pi: ExtensionAPI) {
-	pi.registerFlag("sandbox", { description: "Enable container sandbox tool backend", type: "boolean", default: false });
 	pi.registerFlag("no-sandbox", { description: "Disable container sandbox tool backend", type: "boolean", default: false });
 	pi.registerFlag("sandbox-runtime", { description: "Container runtime: container, docker, or podman", type: "string" });
 	pi.registerFlag("sandbox-image", { description: "Container image for sandbox tools", type: "string" });
 	pi.registerFlag("sandbox-name", { description: "Stable sandbox/ref name; container name is derived from repo, branch, and this name", type: "string" });
-	pi.registerFlag("sandbox-install-deps-on-reuse", { description: "Run installDeps bootstrap even when reusing a container", type: "boolean", default: false });
 	pi.registerFlag("sandbox-git-clone-depth", { description: "Host local clone depth for new sandboxes: 1 shallow default, 0 full history", type: "string" });
-	pi.registerFlag("sandbox-git-ref-untracked", { description: "Untracked files in git-ref mode: ignore, overlay, or commit", type: "string" });
-	pi.registerFlag("sandbox-install-deps", { description: "Dependency bootstrap: auto, copy, or never", type: "string" });
-	pi.registerFlag("sandbox-mise", { description: "Apply .mise.toml/.tool-versions with mise exec: auto or never", type: "string" });
-	pi.registerFlag("sandbox-keep", { description: "Keep sandbox container after shutdown", type: "boolean", default: false });
-	pi.registerFlag("sandbox-git-auto-commit", { description: "Auto-checkpoint sandbox changes after each agent turn", type: "boolean", default: false });
-	pi.registerFlag("sandbox-no-git-auto-commit", { description: "Disable automatic sandbox checkpoints", type: "boolean", default: false });
-	pi.registerFlag("sandbox-git-commit-message", { description: "Automatic checkpoint message mode: ai or timestamp", type: "string" });
-	pi.registerFlag("sandbox-git-commit-prefix", { description: "Prefix for timestamp fallback sandbox checkpoint messages", type: "string" });
-	pi.registerFlag("sandbox-git-commit-coauthor", { description: "Co-authored-by identity for sandbox checkpoint commits", type: "string" });
+	pi.registerFlag("sandbox-install-deps", { description: "Dependency bootstrap: auto or never", type: "string" });
+	pi.registerFlag("sandbox-auto-remove", { description: "Remove the sandbox container after shutdown instead of preserving it for reuse", type: "boolean", default: false });
 	pi.registerFlag("sandbox-env", { description: "Comma-separated host env vars to pass into sandbox commands", type: "string" });
 
 	const sandbox = new ContainerSandbox(pi);
-	const sandboxOnlyTools = new Set(["host_git", "git_commit"]);
-
-	function applySandboxToolActivation() {
-		const config = sandbox.getConfig();
-		let active = pi.getActiveTools();
-		const before = active.length;
-		active = active.filter((name) => {
-			if (!sandboxOnlyTools.has(name)) return true;
-			if (!config.enabled) return false;
-			if (name === "host_git") return config.gitHostTool;
-			if (name === "git_commit") return config.gitCommitTool;
-			return true;
-		});
-		if (active.length !== before) pi.setActiveTools(active);
-	}
 
 	const localRead = createReadTool(process.cwd());
 	const localWrite = createWriteTool(process.cwd());
@@ -1476,47 +1653,8 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
-	pi.registerTool({
-		name: "host_git",
-		label: "git (host)",
-		description:
-			"Run an allowlisted read-only git command on the host repository, including inspecting refs/pi-sandbox/* imported from sandbox sessions. This tool never stages, commits, resets, checks out, or pushes.",
-		promptSnippet: "Inspect the host git repository and imported sandbox refs with allowlisted read-only commands",
-		promptGuidelines: [
-			"Use host_git for read-only inspection of host repository state and refs/pi-sandbox/* imported from sandbox sessions.",
-			"host_git is only for read-only git inspection such as status, diff, log, show, rev-parse, ls-files, grep, and describe; use git_commit to checkpoint/import sandbox work and never push.",
-		],
-		parameters: hostGitSchema,
-		async execute(_id, params, _signal, _onUpdate, ctx) {
-			sandbox.configure(ctx);
-			if (!sandbox.isEnabled()) return { content: text("host_git is disabled because sandbox is disabled."), details: { disabled: true } };
-			return sandbox.runHostGit(params.args);
-		},
-	});
-
-	pi.registerTool({
-		name: "git_commit",
-		label: "git checkpoint",
-		description:
-			"Checkpoint sandbox changes by committing inside the sandbox repo and importing the commit into refs/pi-sandbox/* on the host without modifying the checked-out host branch. It never pushes.",
-		promptSnippet: "Checkpoint sandbox changes locally without pushing",
-		promptGuidelines: [
-			"Use git_commit only when the user explicitly asks for a local commit or when automatic sandbox commits are not sufficient; git_commit never pushes.",
-			"Do not call git_commit in the same tool batch as file-changing tools; wait until file changes have finished so the host sync can include them.",
-		],
-		parameters: gitCommitSchema,
-		async execute(_id, params, _signal, _onUpdate, ctx) {
-			sandbox.configure(ctx);
-			if (!sandbox.isEnabled()) return { content: text("git_commit is disabled because sandbox is disabled."), details: { disabled: true } };
-			const result = await sandbox.checkpointSandboxChanges({ message: params.message, paths: params.paths }, ctx);
-			const details = { commitHash: result.commitHash, sandboxRef: result.sandboxRef };
-			return { content: text(result.message), details };
-		},
-	});
-
 	pi.on("session_start", async (_event, ctx) => {
 		sandbox.configure(ctx);
-		applySandboxToolActivation();
 		sandbox.restoreGitRefState(ctx);
 		await sandbox.preflight(ctx);
 		if (sandbox.isEnabled()) {
@@ -1526,7 +1664,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		sandbox.configure(ctx);
-		applySandboxToolActivation();
 		if (!sandbox.isEnabled()) return;
 		await sandbox.preflight(ctx);
 		if (sandbox.getPreflightError()) throw new Error(`Sandbox unavailable: ${sandbox.getPreflightError()}`);
@@ -1534,21 +1671,32 @@ export default function (pi: ExtensionAPI) {
 		await sandbox.ensure(ctx);
 		config = sandbox.getConfig();
 		const gitRefState = sandbox.getGitRefState();
-		const gitNote = ` After each agent turn, sandbox changes are committed inside the sandbox repo and imported into host ref ${gitRefState?.sandboxRef ?? `${config.gitRefNamespace}/...`}; the checked-out host branch/worktree is not modified. Untracked host files are handled with gitRefUntrackedMode=${config.gitRefUntrackedMode}.`;
-		const hostGitNote = config.gitHostTool
-			? " Use host_git for read-only inspection of the host repository and imported sandbox refs; use git_commit to checkpoint/import sandbox work. Never push."
+		const gitNote = ` After each agent turn, sandbox changes receive an AI-generated commit message and are imported through a validated, hard-coded checkpoint operation into host ref ${gitRefState?.sandboxRef ?? `${GIT_REF_NAMESPACE}/...`}; the checked-out host branch/worktree is not modified. Host-untracked files are handled with hostUntrackedFiles=${config.hostUntrackedFiles}.`;
+		const rebaseNote = sandbox.hasPendingRebase()
+			? " A sandbox rebase is currently pending. Normal automatic checkpoints are paused. Resolve any conflicts inside the container, stage them, run GIT_EDITOR=true git rebase --continue until complete, and leave the tracked worktree clean; never attempt to modify the host ref directly."
 			: "";
 		return {
 			systemPrompt:
 				event.systemPrompt +
 				"\n\nTool execution note: file and shell tools run inside an isolated container copy of the current working directory. Use the normal tool paths and commands; dependency installs and tests run in that container." +
-				hostGitNote +
-				gitNote,
+				gitNote +
+				rebaseNote,
 		};
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("turn_end", async (_event, ctx) => {
 		await sandbox.autoCheckpointSandboxChanges(ctx);
+	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		if (!sandbox.hasPendingRebase()) return;
+		try {
+			const result = await sandbox.finalizePendingRebase(ctx);
+			if (result.completed) ctx.ui.notify(result.message, "info");
+			else ctx.ui.notify(result.message, "warning");
+		} catch (error) {
+			ctx.ui.notify(`Sandbox rebase was not imported: ${error instanceof Error ? error.message : String(error)}`, "error");
+		}
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
@@ -1694,22 +1842,37 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("sandbox", {
-		description: "Show or control the container sandbox (status|checkpoint|copy-out|stop)",
+		description: "Show or control the container sandbox (status|checkpoint|rebase-host|rebase-status|rebase-abort|stop)",
 		handler: async (args, ctx) => {
 			sandbox.configure(ctx);
 			const command = args.trim();
 			if (command === "checkpoint") {
-				await sandbox.checkpoint(ctx);
+				const result = await sandbox.checkpoint(ctx);
+				ctx.ui.notify(result.message, "info");
 				return;
 			}
-			if (command.startsWith("copy-out ")) {
-				const parts = parseShellWords(command.slice("copy-out ".length));
-				if (parts.length < 1 || parts.length > 2) {
-					ctx.ui.notify("Usage: /sandbox copy-out <container-path> [host-path]", "error");
-					return;
+			if (command === "rebase-host") {
+				const result = await sandbox.rebaseHost(ctx);
+				ctx.ui.notify(result.message, result.conflicted ? "warning" : "info");
+				if (result.conflicted) {
+					const listed = result.conflictFiles?.length ? `\n\nConflicted files:\n${result.conflictFiles.map((file) => `- ${file}`).join("\n")}` : "";
+					pi.sendUserMessage(
+						"A sandbox rebase onto the latest host base branch is paused by conflicts. Resolve the conflicts entirely inside the container. " +
+						"Inspect both sides and preserve the intent of the feature and upstream changes. Stage each resolved file with git add, then run " +
+						"GIT_EDITOR=true git rebase --continue. Repeat until the rebase completes, run appropriate tests, and leave no tracked changes. " +
+						"Do not use blanket ours/theirs resolution and do not abort the rebase." +
+						listed,
+					);
 				}
-				const message = await sandbox.copyOut(parts[0], parts[1], ctx);
-				ctx.ui.notify(message, "info");
+				return;
+			}
+			if (command === "rebase-status") {
+				const result = await sandbox.rebaseStatus();
+				ctx.ui.notify(result.message, result.conflicted ? "warning" : "info");
+				return;
+			}
+			if (command === "rebase-abort") {
+				ctx.ui.notify(await sandbox.abortRebase(ctx), "info");
 				return;
 			}
 			if (command === "stop") {
@@ -1720,26 +1883,26 @@ export default function (pi: ExtensionAPI) {
 			const gitRefState = sandbox.getGitRefState();
 			ctx.ui.notify(
 				[
-					`Container sandbox: ${config.enabled ? "enabled" : "disabled"}`,
+					`Container sandbox: ${sandbox.isEnabled() ? "enabled" : "disabled by --no-sandbox"}`,
 					`Runtime: ${config.runtime}`,
 					`Image: ${config.image}`,
 					`Workspace mode: git-ref`,
-					`Git ref namespace: ${config.gitRefNamespace}`,
+					`Git ref namespace: ${GIT_REF_NAMESPACE} (fixed)`,
 					`Git clone depth: ${config.gitCloneDepth === 0 ? "full" : config.gitCloneDepth}`,
-					`Git ref untracked mode: ${config.gitRefUntrackedMode}`,
+					`Host untracked files: ${config.hostUntrackedFiles}`,
 					`Sandbox ref: ${gitRefState?.sandboxRef ?? "(not initialized)"}`,
 					`Sandbox name: ${config.sandboxName || "(session id)"}`,
 					`Active container: ${sandbox.getName() ?? "not started"}`,
 					`Install deps on reuse: ${config.installDepsOnReuse}`,
 					`Install deps: ${config.installDeps}`,
-					`Mise: ${config.mise}`,
-					`Host git tool: ${config.gitHostTool}`,
-					`Host git allowed commands: ${config.gitHostAllowedCommands.join(", ")}`,
-					`Git commit tool: ${config.gitCommitTool}`,
-					`Git auto-commit: ${config.gitAutoCommit}`,
-					`Git commit message mode: ${config.gitCommitMessageMode}`,
+					`Auto-remove container: ${config.autoRemove}`,
+					`Package cache volume: ${PACKAGE_CACHE_VOLUME} -> ${PACKAGE_CACHE_ROOT}`,
+					`Host git tool: removed (no model-callable host commands)`,
+					`Git auto-commit: enabled (fixed)`,
+					`Rebase pending: ${sandbox.hasPendingRebase()}`,
+					`Git commit message mode: AI with timestamp fallback (fixed)`,
 					`Git commit co-author: ${config.gitCommitCoAuthor || "(none)"}`,
-					`Git commit prefix: ${config.gitCommitMessagePrefix}`,
+					`Fallback commit prefix: ${FALLBACK_COMMIT_PREFIX} (fixed)`,
 					`Pass env: ${config.passEnv.length ? config.passEnv.join(", ") : "(none)"}`,
 				].join("\n"),
 				"info",
