@@ -22,36 +22,36 @@
  *   --sandbox-checkpoint-frequency <mode>  turn, agent, or settled
  *   --sandbox-git-clone-depth <n>          1 = shallow default, 0 = full history
  *   --sandbox-install-deps auto|never
- *   --sandbox-auto-remove                 Remove container after shutdown
+ *   --sandbox-lifecycle <mode>            remove, stopped, or running
  *   --sandbox-env FOO,BAR                 Allowlist host env vars for tool commands
  */
 
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { createWriteStream, existsSync, readFileSync } from "node:fs";
-import { cp, mkdir, mkdtemp, open, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { TextContent } from "@earendil-works/pi-ai";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { StringEnum, type TextContent } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { Text } from "@earendil-works/pi-tui";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentSessionEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	CONFIG_DIR_NAME,
 	DEFAULT_MAX_BYTES,
 	type BashOperations,
 	createAgentSession,
-	createBashTool,
+	createBashToolDefinition,
 	createExtensionRuntime,
 	defineTool,
-	createEditTool,
-	createFindTool,
-	createGrepTool,
-	createLsTool,
-	createReadTool,
-	createWriteTool,
+	createEditToolDefinition,
+	createFindToolDefinition,
+	createGrepToolDefinition,
+	createLsToolDefinition,
+	createReadToolDefinition,
+	createWriteToolDefinition,
 	formatSize,
 	getAgentDir,
 	resolveCliModel,
@@ -66,12 +66,13 @@ import {
 	type ToolDefinition,
 	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { Type, type TSchema } from "typebox";
 
 type HostUntrackedFilesMode = "ignore" | "copy";
 type InstallDepsMode = "auto" | "never";
 type CommitTarget = "sandbox-ref" | "current-branch";
 type CheckpointFrequency = "turn" | "agent" | "settled";
+type LifecycleMode = "remove" | "stopped" | "running";
 
 interface GitRefState {
 	sessionId: string;
@@ -83,15 +84,12 @@ interface GitRefState {
 	sandboxBranch: string;
 	repoRoot: string;
 	commitTarget: CommitTarget;
-	vcsBackend: "git";
 }
 
 interface GitRefCheckpointResult {
 	committed: boolean;
 	imported: boolean;
 	message: string;
-	commitHash?: string;
-	sandboxRef?: string;
 }
 
 interface PendingRebase {
@@ -160,8 +158,10 @@ interface ReviewConfig {
 	maxDiffBytes: number;
 }
 
+type ContainerRuntime = "container" | "docker" | "podman";
+
 interface SandboxConfig {
-	runtime: "container" | "docker" | "podman" | string;
+	runtime: ContainerRuntime;
 	image: string;
 	sandboxName: string;
 	commitTarget: CommitTarget;
@@ -172,7 +172,7 @@ interface SandboxConfig {
 	gitCommitCoAuthor: string;
 	gitCommitAiMaxDiffBytes: number;
 	installDeps: InstallDepsMode;
-	autoRemove: boolean;
+	lifecycle: LifecycleMode;
 	passEnv: string[];
 	review: ReviewConfig;
 }
@@ -180,6 +180,7 @@ interface SandboxConfig {
 const DEFAULT_IMAGE = "pi-tool-sandbox:latest";
 const GIT_REF_NAMESPACE = "refs/pi-sandbox";
 const FALLBACK_COMMIT_PREFIX = "pi sandbox";
+const DEFAULT_CAPTURE_BYTES = 16 * 1024 * 1024;
 const PACKAGE_CACHE_ROOT = "/var/cache/pi-packages";
 const PACKAGE_CACHE_ENV: Record<string, string> = {
 	npm_config_cache: `${PACKAGE_CACHE_ROOT}/npm`,
@@ -201,7 +202,7 @@ const DEFAULT_CONFIG: SandboxConfig = {
 	gitCommitCoAuthor: "Pi <pi@localhost>",
 	gitCommitAiMaxDiffBytes: 20_000,
 	installDeps: "never",
-	autoRemove: true,
+	lifecycle: "remove",
 	passEnv: [],
 	review: {
 		model: "",
@@ -217,13 +218,34 @@ interface ExecOptions {
 	signal?: AbortSignal;
 	timeoutMs?: number;
 	onData?: (data: Buffer) => void;
-	streamStdoutOnly?: boolean;
+	maxCaptureBytes?: number;
 }
 
 interface ExecResult {
 	code: number | null;
 	stdout: Buffer;
 	stderr: Buffer;
+	stdoutTruncated: boolean;
+	stderrTruncated: boolean;
+}
+
+interface ContainerInspectMount {
+	source?: string;
+	destination?: string;
+	Source?: string;
+	Destination?: string;
+}
+
+interface ContainerInspectData {
+	configuration?: {
+		image?: { reference?: string };
+		mounts?: ContainerInspectMount[];
+		labels?: Record<string, string>;
+	};
+	Config?: { Image?: string; Labels?: Record<string, string> };
+	ImageName?: string;
+	Mounts?: ContainerInspectMount[];
+	Labels?: Record<string, string>;
 }
 
 function uniq(values: string[]): string[] {
@@ -236,87 +258,141 @@ function parseList(value: unknown): string[] | undefined {
 	return undefined;
 }
 
-function mergeConfig(base: SandboxConfig, overrides: Partial<SandboxConfig>): SandboxConfig {
-	const reviewOverrides = overrides.review && typeof overrides.review === "object" ? overrides.review : undefined;
+type SandboxConfigOverrides = Omit<Partial<SandboxConfig>, "review"> & { review?: Partial<ReviewConfig> };
+
+function mergeConfig(base: SandboxConfig, overrides: SandboxConfigOverrides): SandboxConfig {
 	return {
 		...base,
 		...overrides,
-		passEnv: parseList(overrides.passEnv) ?? base.passEnv,
-		review: { ...base.review, ...reviewOverrides },
+		passEnv: overrides.passEnv ?? base.passEnv,
+		review: { ...base.review, ...overrides.review },
 	};
 }
 
-function readJson(pathName: string): Partial<SandboxConfig> {
-	if (!existsSync(pathName)) return {};
-	try {
-		return JSON.parse(readFileSync(pathName, "utf8"));
-	} catch (error) {
-		console.error(`container-sandbox: could not parse ${pathName}: ${error}`);
-		return {};
+function configRecord(value: unknown, source: string): Record<string, unknown> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${source} must contain a JSON object`);
+	return value as Record<string, unknown>;
+}
+
+function configChoice<T extends string>(value: unknown, allowed: readonly T[], source: string): T {
+	if (typeof value !== "string" || !allowed.includes(value as T)) {
+		throw new Error(`${source} must be one of: ${allowed.join(", ")}`);
 	}
+	return value as T;
 }
 
-function normalizeChoice<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
-	return allowed.includes(value as T) ? (value as T) : fallback;
+function configString(value: unknown, source: string, allowEmpty = true): string {
+	if (typeof value !== "string" || (!allowEmpty && !value.trim())) throw new Error(`${source} must be ${allowEmpty ? "a string" : "a non-empty string"}`);
+	return value;
 }
 
-function normalizeNonNegativeInteger(value: unknown, fallback: number): number {
-	const parsed = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
-	return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+function configBoolean(value: unknown, source: string): boolean {
+	if (typeof value !== "boolean") throw new Error(`${source} must be a boolean`);
+	return value;
+}
+
+function configInteger(value: unknown, source: string, minimum = 0): number {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum) {
+		throw new Error(`${source} must be an integer greater than or equal to ${minimum}`);
+	}
+	return value;
+}
+
+function configPassEnv(value: unknown, source: string): string[] {
+	const names = parseList(value);
+	if (!names) throw new Error(`${source} must be an array or comma-separated string`);
+	for (const name of names) {
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`${source} contains an invalid environment variable name: ${name}`);
+	}
+	return uniq(names);
+}
+
+function validateConfig(value: unknown, source: string): SandboxConfigOverrides {
+	const raw = configRecord(value, source);
+	const allowed = new Set([
+		"runtime", "image", "sandboxName", "commitTarget", "checkpointFrequency", "installDepsOnReuse",
+		"hostUntrackedFiles", "gitCloneDepth", "gitCommitCoAuthor", "gitCommitAiMaxDiffBytes", "installDeps",
+		"lifecycle", "passEnv", "review",
+	]);
+	for (const key of Object.keys(raw)) {
+		if (key === "autoRemove") throw new Error(`${source}.autoRemove was replaced by lifecycle: remove, stopped, or running`);
+		if (!allowed.has(key)) throw new Error(`${source} contains an unknown option: ${key}`);
+	}
+
+	const result: SandboxConfigOverrides = {};
+	if (raw.runtime !== undefined) result.runtime = configChoice(raw.runtime, ["container", "docker", "podman"] as const, `${source}.runtime`);
+	if (raw.image !== undefined) result.image = configString(raw.image, `${source}.image`, false).trim();
+	if (raw.sandboxName !== undefined) result.sandboxName = configString(raw.sandboxName, `${source}.sandboxName`);
+	if (raw.commitTarget !== undefined) result.commitTarget = configChoice(raw.commitTarget, ["sandbox-ref", "current-branch"] as const, `${source}.commitTarget`);
+	if (raw.checkpointFrequency !== undefined) result.checkpointFrequency = configChoice(raw.checkpointFrequency, ["turn", "agent", "settled"] as const, `${source}.checkpointFrequency`);
+	if (raw.installDepsOnReuse !== undefined) result.installDepsOnReuse = configBoolean(raw.installDepsOnReuse, `${source}.installDepsOnReuse`);
+	if (raw.hostUntrackedFiles !== undefined) result.hostUntrackedFiles = configChoice(raw.hostUntrackedFiles, ["ignore", "copy"] as const, `${source}.hostUntrackedFiles`);
+	if (raw.gitCloneDepth !== undefined) result.gitCloneDepth = configInteger(raw.gitCloneDepth, `${source}.gitCloneDepth`);
+	if (raw.gitCommitCoAuthor !== undefined) result.gitCommitCoAuthor = configString(raw.gitCommitCoAuthor, `${source}.gitCommitCoAuthor`);
+	if (raw.gitCommitAiMaxDiffBytes !== undefined) result.gitCommitAiMaxDiffBytes = configInteger(raw.gitCommitAiMaxDiffBytes, `${source}.gitCommitAiMaxDiffBytes`, 1_000);
+	if (raw.installDeps !== undefined) result.installDeps = configChoice(raw.installDeps, ["auto", "never"] as const, `${source}.installDeps`);
+	if (raw.lifecycle !== undefined) result.lifecycle = configChoice(raw.lifecycle, ["remove", "stopped", "running"] as const, `${source}.lifecycle`);
+	if (raw.passEnv !== undefined) result.passEnv = configPassEnv(raw.passEnv, `${source}.passEnv`);
+	if (raw.review !== undefined) {
+		const review = configRecord(raw.review, `${source}.review`);
+		const reviewAllowed = new Set(["model", "thinkingLevel", "maxDiffBytes"]);
+		for (const key of Object.keys(review)) if (!reviewAllowed.has(key)) throw new Error(`${source}.review contains an unknown option: ${key}`);
+		result.review = {};
+		if (review.model !== undefined) result.review.model = configString(review.model, `${source}.review.model`).trim();
+		if (review.thinkingLevel !== undefined) result.review.thinkingLevel = configChoice(review.thinkingLevel, ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, `${source}.review.thinkingLevel`);
+		if (review.maxDiffBytes !== undefined) result.review.maxDiffBytes = configInteger(review.maxDiffBytes, `${source}.review.maxDiffBytes`, 1_000);
+	}
+	return result;
+}
+
+function readJson(pathName: string): SandboxConfigOverrides {
+	if (!existsSync(pathName)) return {};
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(readFileSync(pathName, "utf8"));
+	} catch (error) {
+		throw new Error(`Could not parse ${pathName}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	return validateConfig(parsed, pathName);
+}
+
+function cliChoice<T extends string>(pi: ExtensionAPI, name: string, allowed: readonly T[]): T | undefined {
+	const value = pi.getFlag(name) as string | undefined;
+	return value === undefined ? undefined : configChoice(value, allowed, `--${name}`);
+}
+
+function cliNonNegativeInteger(pi: ExtensionAPI, name: string): number | undefined {
+	const value = pi.getFlag(name) as string | undefined;
+	if (value === undefined) return undefined;
+	const parsed = Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`--${name} must be a non-negative integer`);
+	return parsed;
 }
 
 function loadConfig(cwd: string, projectTrusted: boolean, pi: ExtensionAPI): SandboxConfig {
 	const globalConfig = readJson(path.join(getAgentDir(), "extensions", "container-sandbox.json"));
 	const projectConfig = projectTrusted ? readJson(path.join(cwd, CONFIG_DIR_NAME, "container-sandbox.json")) : {};
-	let config = mergeConfig(mergeConfig(DEFAULT_CONFIG, globalConfig), projectConfig);
-	config.hostUntrackedFiles = normalizeChoice(
-		config.hostUntrackedFiles,
-		["ignore", "copy"] as const,
-		DEFAULT_CONFIG.hostUntrackedFiles,
-	);
-	config.commitTarget = normalizeChoice(
-		config.commitTarget,
-		["sandbox-ref", "current-branch"] as const,
-		DEFAULT_CONFIG.commitTarget,
-	);
-	config.checkpointFrequency = normalizeChoice(
-		config.checkpointFrequency,
-		["turn", "agent", "settled"] as const,
-		DEFAULT_CONFIG.checkpointFrequency,
-	);
-	config.installDeps = normalizeChoice(config.installDeps, ["auto", "never"] as const, DEFAULT_CONFIG.installDeps);
-	config.gitCloneDepth = normalizeNonNegativeInteger(config.gitCloneDepth, DEFAULT_CONFIG.gitCloneDepth);
-	config.gitCommitAiMaxDiffBytes = normalizeNonNegativeInteger(config.gitCommitAiMaxDiffBytes, DEFAULT_CONFIG.gitCommitAiMaxDiffBytes);
-	config.review.model = typeof config.review.model === "string" ? config.review.model.trim() : DEFAULT_CONFIG.review.model;
-	config.review.thinkingLevel = normalizeChoice(
-		config.review.thinkingLevel,
-		["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const,
-		DEFAULT_CONFIG.review.thinkingLevel,
-	);
-	config.review.maxDiffBytes = Math.max(
-		1_000,
-		normalizeNonNegativeInteger(config.review.maxDiffBytes, DEFAULT_CONFIG.review.maxDiffBytes),
-	);
+	const config = mergeConfig(mergeConfig(DEFAULT_CONFIG, globalConfig), projectConfig);
 
-	const runtime = pi.getFlag("sandbox-runtime") as string | undefined;
-	if (runtime) config.runtime = runtime;
+	const runtime = cliChoice(pi, "sandbox-runtime", ["container", "docker", "podman"] as const);
+	if (runtime !== undefined) config.runtime = runtime;
 	const image = pi.getFlag("sandbox-image") as string | undefined;
-	if (image) config.image = image;
+	if (image !== undefined) config.image = configString(image, "--sandbox-image", false).trim();
 	const sandboxName = pi.getFlag("sandbox-name") as string | undefined;
-	if (sandboxName) config.sandboxName = sandboxName;
-	const commitTarget = pi.getFlag("sandbox-commit-target") as string | undefined;
-	if (commitTarget) config.commitTarget = normalizeChoice(commitTarget, ["sandbox-ref", "current-branch"] as const, config.commitTarget);
-	const checkpointFrequency = pi.getFlag("sandbox-checkpoint-frequency") as string | undefined;
-	if (checkpointFrequency) config.checkpointFrequency = normalizeChoice(checkpointFrequency, ["turn", "agent", "settled"] as const, config.checkpointFrequency);
-	const gitCloneDepth = pi.getFlag("sandbox-git-clone-depth") as string | undefined;
-	if (gitCloneDepth !== undefined) config.gitCloneDepth = normalizeNonNegativeInteger(gitCloneDepth, config.gitCloneDepth);
-	const installDeps = pi.getFlag("sandbox-install-deps") as string | undefined;
-	if (installDeps) config.installDeps = normalizeChoice(installDeps, ["auto", "never"] as const, config.installDeps);
-	if (pi.getFlag("sandbox-auto-remove")) config.autoRemove = true;
-	const passEnv = parseList(pi.getFlag("sandbox-env"));
-	if (passEnv) config.passEnv = passEnv;
+	if (sandboxName !== undefined) config.sandboxName = configString(sandboxName, "--sandbox-name");
+	const commitTarget = cliChoice(pi, "sandbox-commit-target", ["sandbox-ref", "current-branch"] as const);
+	if (commitTarget !== undefined) config.commitTarget = commitTarget;
+	const checkpointFrequency = cliChoice(pi, "sandbox-checkpoint-frequency", ["turn", "agent", "settled"] as const);
+	if (checkpointFrequency !== undefined) config.checkpointFrequency = checkpointFrequency;
+	const gitCloneDepth = cliNonNegativeInteger(pi, "sandbox-git-clone-depth");
+	if (gitCloneDepth !== undefined) config.gitCloneDepth = gitCloneDepth;
+	const installDeps = cliChoice(pi, "sandbox-install-deps", ["auto", "never"] as const);
+	if (installDeps !== undefined) config.installDeps = installDeps;
+	const lifecycle = cliChoice(pi, "sandbox-lifecycle", ["remove", "stopped", "running"] as const);
+	if (lifecycle !== undefined) config.lifecycle = lifecycle;
+	const passEnvFlag = pi.getFlag("sandbox-env");
+	if (passEnvFlag !== undefined) config.passEnv = configPassEnv(passEnvFlag, "--sandbox-env");
 
-	config.passEnv = uniq(config.passEnv);
 	return config;
 }
 
@@ -418,9 +494,25 @@ async function run(command: string, args: string[], options: ExecOptions = {}): 
 
 		const stdout: Buffer[] = [];
 		const stderr: Buffer[] = [];
+		const maxCaptureBytes = Math.max(0, options.maxCaptureBytes ?? DEFAULT_CAPTURE_BYTES);
+		let stdoutBytes = 0;
+		let stderrBytes = 0;
+		let stdoutTruncated = false;
+		let stderrTruncated = false;
 		let settled = false;
 		let timedOut = false;
 		let timer: NodeJS.Timeout | undefined;
+
+		const capture = (target: Buffer[], chunk: Buffer, size: number): { size: number; truncated: boolean } => {
+			const remaining = maxCaptureBytes - size;
+			if (remaining <= 0) return { size, truncated: chunk.length > 0 };
+			if (chunk.length <= remaining) {
+				target.push(chunk);
+				return { size: size + chunk.length, truncated: false };
+			}
+			target.push(chunk.subarray(0, remaining));
+			return { size: maxCaptureBytes, truncated: true };
+		};
 
 		const finish = (fn: () => void) => {
 			if (settled) return;
@@ -439,7 +531,8 @@ async function run(command: string, args: string[], options: ExecOptions = {}): 
 		};
 
 		const onAbort = () => kill();
-		options.signal?.addEventListener("abort", onAbort, { once: true });
+		if (options.signal?.aborted) kill();
+		else options.signal?.addEventListener("abort", onAbort, { once: true });
 
 		if (options.timeoutMs && options.timeoutMs > 0) {
 			timer = setTimeout(() => {
@@ -449,19 +542,29 @@ async function run(command: string, args: string[], options: ExecOptions = {}): 
 		}
 
 		child.stdout?.on("data", (chunk: Buffer) => {
-			stdout.push(chunk);
+			const captured = capture(stdout, chunk, stdoutBytes);
+			stdoutBytes = captured.size;
+			stdoutTruncated ||= captured.truncated;
 			options.onData?.(chunk);
 		});
 		child.stderr?.on("data", (chunk: Buffer) => {
-			stderr.push(chunk);
-			if (!options.streamStdoutOnly) options.onData?.(chunk);
+			const captured = capture(stderr, chunk, stderrBytes);
+			stderrBytes = captured.size;
+			stderrTruncated ||= captured.truncated;
+			options.onData?.(chunk);
 		});
 		child.on("error", (error) => finish(() => reject(error)));
 		child.on("close", (code) => {
 			finish(() => {
 				if (options.signal?.aborted) reject(new Error("aborted"));
 				else if (timedOut) reject(new Error("timeout"));
-				else resolve({ code, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) });
+				else resolve({
+					code,
+					stdout: Buffer.concat(stdout),
+					stderr: Buffer.concat(stderr),
+					stdoutTruncated,
+					stderrTruncated,
+				});
 			});
 		});
 
@@ -547,7 +650,7 @@ async function commandOk(command: string, args: string[]): Promise<boolean> {
 	}
 }
 
-class ContainerSandbox {
+class SandboxEngine {
 	private config: SandboxConfig = DEFAULT_CONFIG;
 	private enabled = true;
 	private cwd = process.cwd();
@@ -834,23 +937,47 @@ class ContainerSandbox {
 	}
 
 	private async applyGitRefUntrackedFiles(state: GitRefState) {
-		if (this.config.hostUntrackedFiles === "ignore") return;
 		if (!this.containerName) throw new Error("Sandbox container is not running");
 		const trackedInSandbox = await this.sandboxTrackedFiles(state).catch(() => new Set<string>());
 		const temp = await mkdtemp(path.join(tmpdir(), "pi-sandbox-untracked-"));
 		const listPath = path.join(temp, "host-untracked.zlist");
+		const previousListPath = path.join(temp, "previous-host-untracked.zlist");
+		const metadataPath = path.posix.join(toPosix(state.repoRoot), ".git/info/pi-sandbox-host-untracked");
+		const parseManifest = (buffer: Buffer): string[] => buffer.toString("utf8").split("\0").filter(Boolean);
+		const validateManifestPath = (relativePath: string) => {
+			const normalized = toPosix(relativePath);
+			if (path.posix.isAbsolute(normalized) || normalized.split("/").includes("..") || /[\0\r\n]/.test(normalized)) {
+				throw new Error(`Invalid path in sandbox host-untracked manifest: ${JSON.stringify(relativePath)}`);
+			}
+			return normalized;
+		};
 		try {
-			const count = await this.writeHostUntrackedList(state.repoRoot, listPath, trackedInSandbox);
+			let previousPaths: string[] = [];
+			if ((await this.runtimeExec(["exec", this.containerName, "test", "-s", metadataPath], { timeoutMs: 10_000 })).code === 0) {
+				await this.runtimeExecChecked(["cp", `${this.containerName}:${metadataPath}`, previousListPath], { timeoutMs: 30_000 });
+				previousPaths = parseManifest(await readFile(previousListPath)).map(validateManifestPath);
+			}
+
+			let count = 0;
+			if (this.config.hostUntrackedFiles === "copy") count = await this.writeHostUntrackedList(state.repoRoot, listPath, trackedInSandbox);
+			else await writeFile(listPath, Buffer.alloc(0));
+			const currentPaths = new Set(parseManifest(await readFile(listPath)).map(validateManifestPath));
+			const stalePaths = previousPaths.filter((relativePath) => !currentPaths.has(relativePath) && !trackedInSandbox.has(relativePath));
+			for (let offset = 0; offset < stalePaths.length; offset += 200) {
+				await this.runtimeExecChecked([
+					"exec", "-u", "root", "-w", state.repoRoot, this.containerName, "rm", "-f", "--", ...stalePaths.slice(offset, offset + 200),
+				], { timeoutMs: 30_000 });
+			}
 			if (count > 0) await this.copyListedHostFilesToContainer(listPath, state.repoRoot);
 			await this.runtimeExecChecked(["exec", "-u", "root", this.containerName, "mkdir", "-p", path.posix.join(toPosix(state.repoRoot), ".git/info")]);
-			await this.runtimeExecChecked([
-				"cp",
-				listPath,
-				`${this.containerName}:${path.posix.join(toPosix(state.repoRoot), ".git/info/pi-sandbox-host-untracked")}`,
-			], { timeoutMs: 30_000 });
+			await this.runtimeExecChecked(["cp", listPath, `${this.containerName}:${metadataPath}`], { timeoutMs: 30_000 });
 
-			const compact = await runGitChecked(this.hostUntrackedArgs(state.repoRoot, true), { cwd: state.repoRoot, timeoutMs: 30_000 });
-			const patterns = compact.stdout.toString("utf8").split("\0").filter((value) => value && !value.includes("\n"));
+			const patterns = this.config.hostUntrackedFiles === "copy"
+				? (await runGitChecked(this.hostUntrackedArgs(state.repoRoot, true), { cwd: state.repoRoot, timeoutMs: 30_000 })).stdout
+					.toString("utf8")
+					.split("\0")
+					.filter((value) => value && !value.includes("\n"))
+				: [];
 			const excludeText = [
 				"# BEGIN pi sandbox host untracked files",
 				...patterns.map((relativePath) => `/${toPosix(relativePath)}`),
@@ -868,11 +995,9 @@ class ContainerSandbox {
 
 	private async ensureGitRefState(ctx?: ExtensionContext): Promise<GitRefState> {
 		if (this.gitRefState) {
-			if (this.gitRefState.commitTarget === "current-branch") {
-				const repoRoot = await this.gitRepoRoot();
-				if (repoRoot !== this.gitRefState.repoRoot) throw new Error("Restored current-branch sandbox belongs to a different repository");
-				await this.currentBranchHead(this.gitRefState);
-			}
+			const repoRoot = await this.gitRepoRoot();
+			if (repoRoot !== this.gitRefState.repoRoot) throw new Error("Restored sandbox belongs to a different repository");
+			if (this.gitRefState.commitTarget === "current-branch") await this.currentBranchHead(this.gitRefState);
 			await this.acquireCurrentBranchLock(this.gitRefState);
 			return this.gitRefState;
 		}
@@ -903,14 +1028,19 @@ class ContainerSandbox {
 		if (commitTarget === "current-branch") {
 			sessionKey = defaultSessionKey;
 			sandboxRef = `refs/heads/${baseBranch}`;
-			containerName = `pi-${repoName}-${this.repoIdentity(repoRoot)}-${branchName}-current`.slice(0, 120);
+			const legacyContainerName = `pi-${repoName}-${this.repoIdentity(repoRoot)}-${branchName}-current`;
+			const branchIdentity = createHash("sha256").update(baseBranch).digest("hex").slice(0, 8);
+			containerName = legacyContainerName.length <= 64
+				? legacyContainerName
+				: `pi-${repoName.slice(0, 12)}-${this.repoIdentity(repoRoot)}-${branchName.slice(0, 14)}-${branchIdentity}-current`;
 			sandboxBranch = `pi-current/${branchName}`;
 		} else {
 			const configuredSandboxName = this.config.sandboxName.trim();
 			const refSuffix = configuredSandboxName ? safeRefPath(configuredSandboxName) : defaultSessionKey;
 			sessionKey = configuredSandboxName ? safeName(refSuffix.replace(/\//g, "-"), defaultSessionKey) : defaultSessionKey;
 			sandboxRef = `${GIT_REF_NAMESPACE}/${branchRefPath}/${refSuffix}`;
-			containerName = `pi-${repoName}-${branchName}-${sessionKey}`.slice(0, 120);
+			const refIdentity = createHash("sha256").update(`${repoRoot}\0${sandboxRef}`).digest("hex").slice(0, 10);
+			containerName = `pi-${repoName.slice(0, 12)}-${this.repoIdentity(repoRoot)}-${branchName.slice(0, 10)}-${sessionKey.slice(0, 10)}-${refIdentity.slice(0, 8)}`;
 			sandboxBranch = `pi-sandbox/${sessionKey}`;
 		}
 
@@ -924,7 +1054,6 @@ class ContainerSandbox {
 			sandboxBranch,
 			repoRoot,
 			commitTarget,
-			vcsBackend: "git",
 		};
 		await this.ensureHostSandboxRef(state);
 		await this.acquireCurrentBranchLock(state);
@@ -983,6 +1112,51 @@ class ContainerSandbox {
 		return (await this.runtimeExec(["inspect", name], { timeoutMs: 10_000 })).code === 0;
 	}
 
+	private containerLabels(state: GitRefState): Record<string, string> {
+		return {
+			"pi.container-sandbox.managed": "true",
+			"pi.container-sandbox.repo": this.repoIdentity(state.repoRoot),
+			"pi.container-sandbox.target": state.commitTarget,
+			"pi.container-sandbox.ref": createHash("sha256").update(state.sandboxRef).digest("hex").slice(0, 16),
+			"pi.container-sandbox.config": createHash("sha256")
+				.update(JSON.stringify({ image: this.config.image, packageCache: this.packageCacheHostRoot() }))
+				.digest("hex")
+				.slice(0, 16),
+		};
+	}
+
+	private async validateExistingContainer(name: string, state: GitRefState) {
+		const inspected = await this.runtimeExecChecked(["inspect", name], { timeoutMs: 30_000, maxCaptureBytes: 2 * 1024 * 1024 });
+		if (inspected.stdoutTruncated) throw new Error(`Container metadata is too large to validate: ${name}`);
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(inspected.stdout.toString());
+		} catch {
+			throw new Error(`Container runtime returned invalid metadata for ${name}`);
+		}
+		const item = (Array.isArray(parsed) ? parsed[0] : parsed) as ContainerInspectData | undefined;
+		const appleConfig = item?.configuration;
+		const dockerConfig = item?.Config;
+		const image = appleConfig?.image?.reference ?? dockerConfig?.Image ?? item?.ImageName;
+		const normalizeImage = (value: string) => value.replace(/^(?:docker\.io\/library\/|docker\.io\/|localhost\/)/, "");
+		if (typeof image !== "string" || normalizeImage(image) !== normalizeImage(this.config.image)) {
+			throw new Error(`Existing sandbox container ${name} uses image ${image ?? "(unknown)"}, expected ${this.config.image}; preserve or remove it before retrying`);
+		}
+		const mounts = appleConfig?.mounts ?? item?.Mounts ?? [];
+		const expectedCache = path.resolve(this.packageCacheHostRoot());
+		const cacheMount = mounts.find((mount) => (mount?.destination ?? mount?.Destination) === PACKAGE_CACHE_ROOT);
+		const cacheSource = cacheMount?.source ?? cacheMount?.Source;
+		if (!cacheMount || path.resolve(String(cacheSource ?? "")) !== expectedCache) {
+			throw new Error(`Existing sandbox container ${name} does not have the expected package-cache bind mount; preserve or remove it before retrying`);
+		}
+		const labels = (appleConfig?.labels ?? dockerConfig?.Labels ?? item?.Labels ?? {}) as Record<string, string>;
+		if (labels["pi.container-sandbox.managed"] === "true") {
+			for (const [key, expected] of Object.entries(this.containerLabels(state))) {
+				if (labels[key] !== expected) throw new Error(`Existing sandbox container ${name} has incompatible metadata (${key}); preserve or remove it before retrying`);
+			}
+		}
+	}
+
 	private async containerHasGitRepo(repoRoot: string): Promise<boolean> {
 		if (!this.containerName) return false;
 		return (await this.runtimeExec(["exec", "-w", repoRoot, this.containerName, "git", "rev-parse", "--is-inside-work-tree"], { timeoutMs: 10_000 })).code === 0;
@@ -1003,31 +1177,31 @@ class ContainerSandbox {
 			.toString()
 			.trim();
 		await this.runtimeExecChecked(["exec", "-u", "root", this.containerName, "mkdir", "-p", state.repoRoot, "/tmp/pi-home"]);
-		let reseedExistingCurrentBranch = false;
+		let reseedExistingWorkspace = false;
 		if (await this.containerHasGitRepo(state.repoRoot)) {
-			if (state.commitTarget === "current-branch") {
-				const hostHead = await this.hostSandboxHead(state);
-				const containerHead = (await this.containerGitChecked(["rev-parse", "--verify", "HEAD^{commit}"], { timeoutMs: 10_000 })).stdout
-					.toString()
-					.trim();
-				if (containerHead !== hostHead) {
-					const trackedStatus = await this.containerTrackedStatus();
-					const hostKnowsContainerHead = (await runGit(["cat-file", "-e", `${containerHead}^{commit}`], { cwd: state.repoRoot, timeoutMs: 10_000 })).code === 0;
-					const hostAdvanced = hostKnowsContainerHead &&
-						(await runGit(["merge-base", "--is-ancestor", containerHead, hostHead], { cwd: state.repoRoot, timeoutMs: 30_000 })).code === 0;
-					if (containerHead === state.baseCommit && trackedStatus && hostAdvanced) {
-						// A resumed session may contain unpublished work after the host
-						// advanced. Preserve it so /sandbox rebase can recover the turn.
-					} else if (!trackedStatus && hostAdvanced) {
-						reseedExistingCurrentBranch = true;
+			const hostHead = await this.hostSandboxHead(state);
+			const containerHead = (await this.containerGitChecked(["rev-parse", "--verify", "HEAD^{commit}"], { timeoutMs: 10_000 })).stdout
+				.toString()
+				.trim();
+			if (containerHead !== hostHead) {
+				const workspaceStatus = await this.containerWorkspaceStatus();
+				const hostKnowsContainerHead = (await runGit(["cat-file", "-e", `${containerHead}^{commit}`], { cwd: state.repoRoot, timeoutMs: 10_000 })).code === 0;
+				const hostAdvanced = hostKnowsContainerHead &&
+					(await runGit(["merge-base", "--is-ancestor", containerHead, hostHead], { cwd: state.repoRoot, timeoutMs: 30_000 })).code === 0;
+				if (state.commitTarget === "current-branch" && containerHead === state.baseCommit && workspaceStatus && hostAdvanced) {
+					// A resumed current-branch session may contain unpublished work
+					// after the host advanced. Preserve it for /sandbox rebase.
+				} else if (!workspaceStatus && hostAdvanced) {
+					reseedExistingWorkspace = true;
+					if (state.commitTarget === "current-branch") {
 						state.baseCommit = hostHead;
 						this.pi.appendEntry("container-sandbox.git-ref-state", state);
-					} else {
-						throw new Error("Current-branch sandbox is out of sync with the host branch; preserve or inspect the container before retrying");
 					}
+				} else {
+					throw new Error(`${state.commitTarget} sandbox container is out of sync with ${state.sandboxRef}; preserve or inspect the container before retrying`);
 				}
 			}
-			if (!reseedExistingCurrentBranch) {
+			if (!reseedExistingWorkspace) {
 				await this.applyGitRefUntrackedFiles(state);
 				await this.runtimeExecChecked(["exec", "-u", "root", this.containerName, "chown", "-R", identity || "0:0", state.repoRoot, "/tmp/pi-home"]);
 				await this.runtimeExecChecked(["exec", "-u", "root", this.containerName, "chmod", "u+rwx", state.repoRoot, "/tmp/pi-home"]);
@@ -1105,6 +1279,13 @@ class ContainerSandbox {
 		});
 	}
 
+	private async startContainer(name: string) {
+		const result = await this.runtimeExec(["start", name], { timeoutMs: 60_000 });
+		if (result.code === 0) return;
+		if ((await this.runtimeExec(["exec", name, "true"], { timeoutMs: 10_000 })).code === 0) return;
+		throw new Error(result.stderr.toString().trim() || `Could not start sandbox container ${name}`);
+	}
+
 	private async createContainer(ctx?: ExtensionContext) {
 		await this.ensureRuntime();
 		await this.ensurePackageCacheDirectories();
@@ -1117,7 +1298,8 @@ class ContainerSandbox {
 
 		if (await this.containerExists(targetName)) {
 			this.reusedContainer = true;
-			await this.runtimeExecChecked(["start", targetName]);
+			await this.validateExistingContainer(targetName, state);
+			await this.startContainer(targetName);
 			await this.prepareGitRefWorkspace(ctx);
 			this.started = true;
 			ctx?.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", `sandbox: ${targetName} (reused)`));
@@ -1129,6 +1311,7 @@ class ContainerSandbox {
 			"create",
 			"--name",
 			targetName,
+			...Object.entries(this.containerLabels(state)).flatMap(([key, value]) => ["--label", `${key}=${value}`]),
 			"-e",
 			"HOME=/tmp/pi-home",
 			"-e",
@@ -1212,6 +1395,7 @@ fi
 			signal: options.signal,
 			timeoutMs: options.timeout ? options.timeout * 1000 : undefined,
 			onData: options.onData,
+			maxCaptureBytes: 0,
 		});
 		return { exitCode: result.code };
 	}
@@ -1228,10 +1412,6 @@ fi
 		if (!this.containerName) throw new Error("Sandbox container is not running");
 		const execArgs = options.input === undefined ? ["exec", this.containerName] : ["exec", "-i", this.containerName];
 		return this.runtimeExec([...execArgs, ...args], options);
-	}
-
-	private gitPathspec(paths?: string[]): string[] {
-		return paths && paths.length > 0 ? paths : ["."];
 	}
 
 	private async unstageCopiedHostFiles(state: GitRefState, expectedParent: string) {
@@ -1375,7 +1555,8 @@ fi
 		if (!this.containerName) await this.ensure();
 		if (!this.containerName) throw new Error("Sandbox container is not running");
 		const execArgs = options.input === undefined ? ["exec"] : ["exec", "-i"];
-		return this.runtimeExec([...execArgs, "-w", this.cwd, this.containerName, "git", ...args], options);
+		const gitWorkdir = this.gitRefState?.repoRoot ?? this.cwd;
+		return this.runtimeExec([...execArgs, "-w", gitWorkdir, this.containerName, "git", ...args], options);
 	}
 
 	private async containerGitChecked(args: string[], options: ExecOptions = {}) {
@@ -1428,32 +1609,68 @@ fi
 		if (updatedHead !== importedHead) throw new Error(`Current branch did not advance to imported commit ${importedHead}`);
 	}
 
-	private async importSandboxHeadToHost(state: GitRefState, expectedParent: string): Promise<{ imported: boolean; commitHash: string }> {
+	private async importContainerHistory<T>(
+		state: GitRefState,
+		sandboxHead: string,
+		baseCommit: string,
+		purpose: "checkpoint" | "rebase",
+		useImportedHead: (importedHead: string) => Promise<T>,
+	): Promise<T> {
 		if (!this.containerName) throw new Error("Sandbox container is not running");
+		const containerName = this.containerName;
+		const nonce = randomBytes(16).toString("hex");
+		const bundlePath = `/tmp/pi-sandbox-${purpose}-${state.sessionKey}-${nonce}.bundle`;
+		const importRef = `refs/pi-sandbox-import/${state.sessionKey}/${purpose}-${nonce}`;
+		const temp = await mkdtemp(path.join(tmpdir(), `pi-sandbox-${purpose}-`));
+		const hostBundle = path.join(temp, `${purpose}.bundle`);
+		try {
+			await this.containerGitChecked(["bundle", "create", bundlePath, "HEAD", `^${baseCommit}`], { timeoutMs: 5 * 60 * 1000 });
+			await this.runtimeExecChecked(["cp", `${containerName}:${bundlePath}`, hostBundle], { timeoutMs: 5 * 60 * 1000 });
+			await runGitChecked(["fetch", "--no-write-fetch-head", hostBundle, `+HEAD:${importRef}`], {
+				cwd: state.repoRoot,
+				timeoutMs: 5 * 60 * 1000,
+			});
+			const importedHead = (await runGitChecked(["rev-parse", "--verify", `${importRef}^{commit}`], { cwd: state.repoRoot, timeoutMs: 10_000 })).stdout
+				.toString()
+				.trim();
+			if (importedHead !== sandboxHead) throw new Error(`Imported ${purpose} does not match the sandbox HEAD`);
+			await runGitChecked(["fsck", "--strict", "--no-reflogs", importedHead], { cwd: state.repoRoot, timeoutMs: 5 * 60 * 1000 });
+			return await useImportedHead(importedHead);
+		} finally {
+			await runGit(["update-ref", "-d", importRef], { cwd: state.repoRoot, timeoutMs: 30_000 }).catch(() => undefined);
+			await rm(temp, { recursive: true, force: true });
+			await this.runtimeExec(["exec", containerName, "rm", "-f", bundlePath]).catch(() => undefined);
+		}
+	}
+
+	private async publishImportedHead(
+		state: GitRefState,
+		importedHead: string,
+		expectedTargetHead: string,
+		recoveryDescription: string,
+	) {
+		if (state.commitTarget === "current-branch") {
+			try {
+				await this.fastForwardCurrentBranch(state, importedHead, expectedTargetHead);
+			} catch (error) {
+				const recoveryRef = `refs/pi-sandbox-recovery/${safeRefPath(state.baseBranch)}/${state.sessionKey}`;
+				await runGitChecked(["update-ref", recoveryRef, importedHead], { cwd: state.repoRoot, timeoutMs: 30_000 });
+				throw new Error(`${error instanceof Error ? error.message : String(error)}. ${recoveryDescription} was preserved at ${recoveryRef}`);
+			}
+		} else {
+			// Compare-and-swap prevents concurrent sessions sharing a ref from
+			// silently overwriting one another.
+			await runGitChecked(["update-ref", state.sandboxRef, importedHead, expectedTargetHead], { cwd: state.repoRoot, timeoutMs: 30_000 });
+		}
+	}
+
+	private async importSandboxHeadToHost(state: GitRefState, expectedParent: string): Promise<{ imported: boolean; commitHash: string }> {
 		const sandboxHead = (await this.containerGitChecked(["rev-parse", "--verify", "HEAD^{commit}"], { timeoutMs: 10_000 })).stdout
 			.toString()
 			.trim();
 		if (sandboxHead === expectedParent) return { imported: false, commitHash: sandboxHead };
 
-		const nonce = randomBytes(16).toString("hex");
-		const bundlePath = `/tmp/pi-sandbox-${state.sessionKey}-${nonce}.bundle`;
-		const importRef = `refs/pi-sandbox-import/${state.sessionKey}/${nonce}`;
-		await this.containerGitChecked(["bundle", "create", bundlePath, "HEAD", `^${expectedParent}`], { timeoutMs: 5 * 60 * 1000 });
-		const temp = await mkdtemp(path.join(tmpdir(), "pi-sandbox-bundle-"));
-		const hostBundle = path.join(temp, "sandbox.bundle");
-		let importedHead: string | undefined;
-		try {
-			await this.runtimeExecChecked(["cp", `${this.containerName}:${bundlePath}`, hostBundle], { timeoutMs: 5 * 60 * 1000 });
-			await runGitChecked(["fetch", "--no-write-fetch-head", hostBundle, `+HEAD:${importRef}`], {
-				cwd: state.repoRoot,
-				timeoutMs: 5 * 60 * 1000,
-			});
-			importedHead = (await runGitChecked(["rev-parse", "--verify", `${importRef}^{commit}`], { cwd: state.repoRoot, timeoutMs: 10_000 })).stdout
-				.toString()
-				.trim();
-			if (importedHead !== sandboxHead) throw new Error("Imported checkpoint does not match the sandbox HEAD");
-
-			await runGitChecked(["fsck", "--strict", "--no-reflogs", importedHead], { cwd: state.repoRoot, timeoutMs: 5 * 60 * 1000 });
+		await this.importContainerHistory(state, sandboxHead, expectedParent, "checkpoint", async (importedHead) => {
 			const importedParent = (await runGitChecked(["rev-parse", "--verify", `${importedHead}^`], { cwd: state.repoRoot, timeoutMs: 10_000 })).stdout
 				.toString()
 				.trim();
@@ -1465,38 +1682,19 @@ fi
 				timeoutMs: 30_000,
 			})).stdout.toString().trim();
 			if (commitCount !== "1") throw new Error(`Refusing sandbox checkpoint containing ${commitCount} commits; expected exactly 1`);
-
-			if (state.commitTarget === "current-branch") {
-				try {
-					await this.fastForwardCurrentBranch(state, importedHead, expectedParent);
-				} catch (error) {
-					const recoveryRef = `refs/pi-sandbox-recovery/${safeRefPath(state.baseBranch)}/${state.sessionKey}`;
-					await runGitChecked(["update-ref", recoveryRef, importedHead], { cwd: state.repoRoot, timeoutMs: 30_000 });
-					throw new Error(`${error instanceof Error ? error.message : String(error)}. Imported work was preserved at ${recoveryRef}`);
-				}
-			} else {
-				// Compare-and-swap prevents concurrent sessions sharing a ref from
-				// silently overwriting one another.
-				await runGitChecked(["update-ref", state.sandboxRef, importedHead, expectedParent], { cwd: state.repoRoot, timeoutMs: 30_000 });
-			}
-		} finally {
-			await runGit(["update-ref", "-d", importRef], { cwd: state.repoRoot, timeoutMs: 30_000 }).catch(() => undefined);
-			await rm(temp, { recursive: true, force: true });
-			await this.runtimeExec(["exec", this.containerName, "rm", "-f", bundlePath]).catch(() => undefined);
-		}
+			await this.publishImportedHead(state, importedHead, expectedParent, "Imported work");
+		});
 		return { imported: true, commitHash: sandboxHead };
 	}
 
 	private async createSandboxCheckpoint(
 		state: GitRefState,
 		expectedParent: string,
-		message?: string,
 		ctx?: ExtensionContext,
-		paths?: string[],
 	): Promise<{ committed: boolean; sandboxHead: string }> {
-		const pathspec = this.gitPathspec(paths);
+		const pathspec = ["."];
 		let committed = false;
-		let commitMessage = message?.trim();
+		let commitMessage: string | undefined;
 
 		// Rebuild the checkpoint from the index and the authoritative baseline.
 		// This deliberately ignores any commits or history rewrites the agent may
@@ -1545,14 +1743,14 @@ fi
 		return { committed, sandboxHead };
 	}
 
-	private async checkpointGitRefUnlocked(message?: string, ctx?: ExtensionContext, paths?: string[]): Promise<GitRefCheckpointResult> {
+	private async checkpointGitRefUnlocked(ctx?: ExtensionContext): Promise<GitRefCheckpointResult> {
 		if (!this.isEnabled()) throw new Error("Sandbox is disabled by --no-sandbox");
 		if (this.pendingRebase) throw new Error("Sandbox rebase is pending; complete or abort it before checkpointing");
 		await this.ensure(ctx);
 		const state = await this.ensureGitRefState(ctx);
 		const expectedParent = state.commitTarget === "current-branch" ? state.baseCommit : await this.hostSandboxHead(state);
 		if (state.commitTarget === "current-branch") await this.assertCurrentBranchBaseline(state, expectedParent);
-		const checkpoint = await this.createSandboxCheckpoint(state, expectedParent, message, ctx, paths);
+		const checkpoint = await this.createSandboxCheckpoint(state, expectedParent, ctx);
 		const imported = await this.importSandboxHeadToHost(state, expectedParent);
 		if (state.commitTarget === "current-branch" && imported.imported) {
 			state.baseCommit = imported.commitHash;
@@ -1562,13 +1760,11 @@ fi
 			committed: checkpoint.committed,
 			imported: imported.imported,
 			message: `${checkpoint.committed ? "Committed" : "No new commit"}; ${imported.imported ? "imported" : "ref already current"} ${state.sandboxRef} @ ${imported.commitHash.slice(0, 12)}`,
-			commitHash: imported.commitHash,
-			sandboxRef: state.sandboxRef,
 		};
 	}
 
-	async checkpointGitRef(message?: string, ctx?: ExtensionContext, paths?: string[]): Promise<GitRefCheckpointResult> {
-		const operation = this.checkpointTail.then(() => this.checkpointGitRefUnlocked(message, ctx, paths));
+	async checkpointGitRef(ctx?: ExtensionContext): Promise<GitRefCheckpointResult> {
+		const operation = this.checkpointTail.then(() => this.checkpointGitRefUnlocked(ctx));
 		this.checkpointTail = operation.catch(() => undefined);
 		return operation;
 	}
@@ -1598,6 +1794,10 @@ fi
 		return (await this.containerGitChecked(["status", "--porcelain", "--untracked-files=no"], { timeoutMs: 30_000 })).stdout
 			.toString()
 			.trim();
+	}
+
+	private async containerWorkspaceStatus(): Promise<string> {
+		return (await this.containerGitChecked(["status", "--porcelain"], { timeoutMs: 30_000 })).stdout.toString().trim();
 	}
 
 	private validateReviewRevision(revision: string): string {
@@ -1706,33 +1906,12 @@ fi
 		this.setPendingRebase(undefined);
 	}
 
-	private async rebaseCurrentBranch(ctx?: ExtensionContext): Promise<RebaseResult> {
-		await this.ensure(ctx);
-		if (this.pendingRebase) return this.rebaseStatus();
-		const state = await this.ensureGitRefState(ctx);
-		const oldBase = state.baseCommit;
-		const newBase = await this.currentBranchHead(state);
-		if ((await runGit(["merge-base", "--is-ancestor", oldBase, newBase], { cwd: state.repoRoot, timeoutMs: 30_000 })).code !== 0) {
-			throw new Error("Cannot automatically rebase after a non-fast-forward update of the host branch");
-		}
-		const hostStatus = (await runGitChecked(["status", "--porcelain", "--untracked-files=no"], {
-			cwd: state.repoRoot,
-			timeoutMs: 30_000,
-		})).stdout.toString().trim();
-		if (hostStatus) throw new Error("Cannot rebase sandbox while host tracked files are modified");
-		if (newBase === oldBase) {
-			return { completed: true, conflicted: false, message: `Sandbox is already based on ${state.baseBranch} @ ${newBase.slice(0, 12)}` };
-		}
-		const checkpoint = await this.createSandboxCheckpoint(state, oldBase, undefined, ctx);
-		const oldSandboxTip = checkpoint.sandboxHead;
-		const oldBaseIsAncestor = (await this.containerGit(["merge-base", "--is-ancestor", oldBase, oldSandboxTip], { timeoutMs: 30_000 })).code === 0;
-		if (!oldBaseIsAncestor) throw new Error("Sandbox checkpoint does not descend from its recorded host baseline");
-		const expectedCommitCount = Number((await this.containerGitChecked(["rev-list", "--count", `${oldBase}..${oldSandboxTip}`], {
-			timeoutMs: 30_000,
-		})).stdout.toString().trim());
-		if (!Number.isSafeInteger(expectedCommitCount) || expectedCommitCount < 0) throw new Error("Could not determine sandbox commit count");
-
-		const baseRef = state.sandboxRef;
+	private async startContainerRebase(
+		state: GitRefState,
+		plan: { oldBase: string; newBase: string; oldSandboxTip: string; expectedCommitCount: number; baseRef: string },
+		ctx?: ExtensionContext,
+	): Promise<RebaseResult> {
+		const { oldBase, newBase, oldSandboxTip, expectedCommitCount, baseRef } = plan;
 		const containerBaseRef = `refs/pi-sandbox-base/${state.sessionKey}/${newBase.slice(0, 16)}`;
 		await this.transferHostBaseToContainer(state, baseRef, newBase, containerBaseRef);
 		await this.containerGitChecked(["switch", "-C", state.sandboxBranch, oldSandboxTip], { timeoutMs: 60_000 });
@@ -1781,13 +1960,48 @@ fi
 		throw new Error(result.stderr.toString().trim() || result.stdout.toString().trim() || "Container rebase failed");
 	}
 
+	private async rebaseCurrentBranch(ctx?: ExtensionContext): Promise<RebaseResult> {
+		await this.ensure(ctx);
+		if (this.pendingRebase) return this.rebaseStatus();
+		const state = await this.ensureGitRefState(ctx);
+		const oldBase = state.baseCommit;
+		const newBase = await this.currentBranchHead(state);
+		if ((await runGit(["merge-base", "--is-ancestor", oldBase, newBase], { cwd: state.repoRoot, timeoutMs: 30_000 })).code !== 0) {
+			throw new Error("Cannot automatically rebase after a non-fast-forward update of the host branch");
+		}
+		const hostStatus = (await runGitChecked(["status", "--porcelain", "--untracked-files=no"], {
+			cwd: state.repoRoot,
+			timeoutMs: 30_000,
+		})).stdout.toString().trim();
+		if (hostStatus) throw new Error("Cannot rebase sandbox while host tracked files are modified");
+		if (newBase === oldBase) {
+			return { completed: true, conflicted: false, message: `Sandbox is already based on ${state.baseBranch} @ ${newBase.slice(0, 12)}` };
+		}
+		const checkpoint = await this.createSandboxCheckpoint(state, oldBase, ctx);
+		const oldSandboxTip = checkpoint.sandboxHead;
+		const oldBaseIsAncestor = (await this.containerGit(["merge-base", "--is-ancestor", oldBase, oldSandboxTip], { timeoutMs: 30_000 })).code === 0;
+		if (!oldBaseIsAncestor) throw new Error("Sandbox checkpoint does not descend from its recorded host baseline");
+		const expectedCommitCount = Number((await this.containerGitChecked(["rev-list", "--count", `${oldBase}..${oldSandboxTip}`], {
+			timeoutMs: 30_000,
+		})).stdout.toString().trim());
+		if (!Number.isSafeInteger(expectedCommitCount) || expectedCommitCount < 0) throw new Error("Could not determine sandbox commit count");
+
+		return this.startContainerRebase(state, {
+			oldBase,
+			newBase,
+			oldSandboxTip,
+			expectedCommitCount,
+			baseRef: state.sandboxRef,
+		}, ctx);
+	}
+
 	async rebaseHost(ctx?: ExtensionContext): Promise<RebaseResult> {
 		if (this.config.commitTarget === "current-branch") return this.rebaseCurrentBranch(ctx);
 		await this.ensure(ctx);
 		if (this.pendingRebase) return this.rebaseStatus();
 
 		// Capture all current work before selecting the old sandbox tip.
-		await this.checkpointGitRef(undefined, ctx);
+		await this.checkpointGitRef(ctx);
 		const state = await this.ensureGitRefState(ctx);
 		const baseRef = `refs/heads/${state.baseBranch}`;
 		const baseExists = (await runGit(["show-ref", "--verify", "--quiet", baseRef], { cwd: state.repoRoot, timeoutMs: 10_000 })).code === 0;
@@ -1824,55 +2038,13 @@ fi
 		})).stdout.toString().trim());
 		if (!Number.isSafeInteger(expectedCommitCount) || expectedCommitCount < 0) throw new Error("Could not determine sandbox commit count");
 
-		const containerBaseRef = `refs/pi-sandbox-base/${state.sessionKey}/${newBase.slice(0, 16)}`;
-		await this.transferHostBaseToContainer(state, baseRef, newBase, containerBaseRef);
-		await this.containerGitChecked(["switch", "-C", state.sandboxBranch, oldSandboxTip], { timeoutMs: 60_000 });
-
-		const pending: PendingRebase = {
+		return this.startContainerRebase(state, {
 			oldBase,
 			newBase,
 			oldSandboxTip,
 			expectedCommitCount,
-			containerBaseRef,
-			startedAt: new Date().toISOString(),
-		};
-		this.setPendingRebase(pending);
-		ctx?.ui.setStatus("sandbox-rebase", ctx.ui.theme.fg("warning", `rebase: ${state.baseBranch}`));
-
-		if (expectedCommitCount === 0) {
-			await this.containerGitChecked(["reset", "--hard", newBase], { timeoutMs: 60_000 });
-			return this.finalizePendingRebase(ctx);
-		}
-
-		await this.ensureContainerGitIdentity(state);
-		const result = await this.containerGit(
-			[
-				"-c", "core.hooksPath=/dev/null",
-				"-c", "commit.gpgsign=false",
-				"-c", "core.editor=true",
-				"-c", "sequence.editor=true",
-				"-c", "rerere.enabled=true",
-				"rebase",
-				"--reapply-cherry-picks",
-				"--empty=keep",
-				"--onto", newBase,
-				oldBase,
-			],
-			{ timeoutMs: 20 * 60 * 1000 },
-		);
-		if (result.code === 0) return this.finalizePendingRebase(ctx);
-		if (await this.containerRebaseInProgress()) {
-			const conflictFiles = await this.rebaseConflictFiles();
-			return {
-				completed: false,
-				conflicted: true,
-				message: `Rebase paused with ${conflictFiles.length} conflicted file(s). The agent will resolve them inside the container.`,
-				conflictFiles,
-			};
-		}
-
-		await this.abortRebase(ctx);
-		throw new Error(result.stderr.toString().trim() || result.stdout.toString().trim() || "Container rebase failed");
+			baseRef,
+		}, ctx);
 	}
 
 	async finalizePendingRebase(ctx?: ExtensionContext): Promise<RebaseResult> {
@@ -1913,50 +2085,23 @@ fi
 			return { completed: true, conflicted: false, message: `Rebased sandbox onto ${state.baseBranch} @ ${pending.newBase.slice(0, 12)}` };
 		}
 
-		const nonce = randomBytes(16).toString("hex");
-		const bundlePath = `/tmp/pi-sandbox-rebase-${state.sessionKey}-${nonce}.bundle`;
-		const importRef = `refs/pi-sandbox-import/${state.sessionKey}/rebase-${nonce}`;
-		await this.containerGitChecked(["bundle", "create", bundlePath, "HEAD", `^${pending.newBase}`], { timeoutMs: 5 * 60 * 1000 });
-		const temp = await mkdtemp(path.join(tmpdir(), "pi-sandbox-rebase-"));
-		const hostBundle = path.join(temp, "rebase.bundle");
-		let importedHead: string | undefined;
-		try {
-			await this.runtimeExecChecked(["cp", `${this.containerName}:${bundlePath}`, hostBundle], { timeoutMs: 5 * 60 * 1000 });
-			await runGitChecked(["fetch", "--no-write-fetch-head", hostBundle, `+HEAD:${importRef}`], { cwd: state.repoRoot, timeoutMs: 5 * 60 * 1000 });
-			importedHead = (await runGitChecked(["rev-parse", "--verify", `${importRef}^{commit}`], { cwd: state.repoRoot, timeoutMs: 10_000 })).stdout
-				.toString()
-				.trim();
-			if (importedHead !== sandboxHead) throw new Error("Imported rebased tip does not match the container tip");
-			await runGitChecked(["fsck", "--strict", "--no-reflogs", importedHead], { cwd: state.repoRoot, timeoutMs: 5 * 60 * 1000 });
-			if ((await runGit(["merge-base", "--is-ancestor", pending.newBase, importedHead], { cwd: state.repoRoot, timeoutMs: 30_000 })).code !== 0) {
+		const importedHead = await this.importContainerHistory(state, sandboxHead, pending.newBase, "rebase", async (head) => {
+			if ((await runGit(["merge-base", "--is-ancestor", pending.newBase, head], { cwd: state.repoRoot, timeoutMs: 30_000 })).code !== 0) {
 				throw new Error("Imported rebased history does not descend from the new base");
 			}
-			const importedCount = (await runGitChecked(["rev-list", "--count", `${pending.newBase}..${importedHead}`], { cwd: state.repoRoot, timeoutMs: 30_000 })).stdout
+			const importedCount = (await runGitChecked(["rev-list", "--count", `${pending.newBase}..${head}`], { cwd: state.repoRoot, timeoutMs: 30_000 })).stdout
 				.toString()
 				.trim();
 			if (importedCount !== String(pending.expectedCommitCount)) throw new Error(`Imported rebase has ${importedCount} commits; expected ${pending.expectedCommitCount}`);
-			const mergeCount = (await runGitChecked(["rev-list", "--count", "--merges", `${pending.newBase}..${importedHead}`], { cwd: state.repoRoot, timeoutMs: 30_000 })).stdout
+			const mergeCount = (await runGitChecked(["rev-list", "--count", "--merges", `${pending.newBase}..${head}`], { cwd: state.repoRoot, timeoutMs: 30_000 })).stdout
 				.toString()
 				.trim();
 			if (mergeCount !== "0") throw new Error("Imported rebased history contains unexpected merge commits");
-			if (state.commitTarget === "current-branch") {
-				try {
-					await this.fastForwardCurrentBranch(state, importedHead, pending.newBase);
-				} catch (error) {
-					const recoveryRef = `refs/pi-sandbox-recovery/${safeRefPath(state.baseBranch)}/${state.sessionKey}`;
-					await runGitChecked(["update-ref", recoveryRef, importedHead], { cwd: state.repoRoot, timeoutMs: 30_000 });
-					throw new Error(`${error instanceof Error ? error.message : String(error)}. Rebased work was preserved at ${recoveryRef}`);
-				}
-			} else {
-				await runGitChecked(["update-ref", state.sandboxRef, importedHead, pending.oldSandboxTip], { cwd: state.repoRoot, timeoutMs: 30_000 });
-			}
-		} finally {
-			await runGit(["update-ref", "-d", importRef], { cwd: state.repoRoot, timeoutMs: 30_000 }).catch(() => undefined);
-			await rm(temp, { recursive: true, force: true });
-			if (this.containerName) await this.runtimeExec(["exec", this.containerName, "rm", "-f", bundlePath]).catch(() => undefined);
-		}
+			await this.publishImportedHead(state, head, state.commitTarget === "current-branch" ? pending.newBase : pending.oldSandboxTip, "Rebased work");
+			return head;
+		});
 
-		await this.completeRebaseState(state, pending, state.commitTarget === "current-branch" ? importedHead! : pending.newBase);
+		await this.completeRebaseState(state, pending, state.commitTarget === "current-branch" ? importedHead : pending.newBase);
 		ctx?.ui.setStatus("sandbox-rebase", undefined);
 		return { completed: true, conflicted: false, message: `Rebased ${pending.expectedCommitCount} commit(s) onto ${state.baseBranch} @ ${pending.newBase.slice(0, 12)}` };
 	}
@@ -2004,7 +2149,7 @@ fi
 	async autoCheckpointSandboxChanges(ctx?: ExtensionContext) {
 		if (!this.isEnabled() || this.pendingRebase) return;
 		try {
-			const result = await this.checkpointGitRef(undefined, ctx);
+			const result = await this.checkpointGitRef(ctx);
 			if (result.committed || result.imported) ctx?.ui.notify(result.message, "info");
 		} catch (error) {
 			if (error instanceof HostBranchAdvancedError) {
@@ -2017,10 +2162,10 @@ fi
 
 
 	async checkpoint(ctx?: ExtensionContext) {
-		return this.checkpointGitRef(undefined, ctx);
+		return this.checkpointGitRef(ctx);
 	}
 
-	async shutdown(ctx?: ExtensionContext) {
+	async shutdown(ctx?: ExtensionContext, explicitStop = false) {
 		const containerToCleanup = this.containerName;
 		try {
 			// Do not auto-checkpoint unless the sandbox was actually started.
@@ -2030,11 +2175,9 @@ fi
 			if (this.started && this.containerName) await this.autoCheckpointSandboxChanges(ctx);
 		} finally {
 			if (containerToCleanup) {
-				if (this.config.autoRemove) {
+				if (this.config.lifecycle === "remove") {
 					await this.runtimeExec(["rm", "-f", containerToCleanup]).catch(() => undefined);
-				} else {
-					// Preserve the container filesystem for reuse, but do not leave old
-					// sessions consuming resources after resume/fork/new/quit.
+				} else if (explicitStop || this.config.lifecycle === "stopped") {
 					await this.runtimeExec(["stop", containerToCleanup]).catch(() => undefined);
 				}
 			}
@@ -2048,15 +2191,70 @@ fi
 	}
 }
 
-const grepSchema = Type.Object({
-	pattern: Type.String({ description: "Search pattern (regex or literal string)" }),
-	path: Type.Optional(Type.String({ description: "Directory or file to search (default: current directory)" })),
-	glob: Type.Optional(Type.String({ description: "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'" })),
-	ignoreCase: Type.Optional(Type.Boolean({ description: "Case-insensitive search (default: false)" })),
-	literal: Type.Optional(Type.Boolean({ description: "Treat pattern as literal string instead of regex (default: false)" })),
-	context: Type.Optional(Type.Number({ description: "Number of lines to show before and after each match (default: 0)" })),
-	limit: Type.Optional(Type.Number({ description: "Maximum number of matches to return (default: 100)" })),
-});
+class SandboxLifecycleComponent {
+	constructor(private readonly engine: SandboxEngine) {}
+	ensure(ctx?: ExtensionContext) { return this.engine.ensure(ctx); }
+	execShell(command: string, cwd: string, options: { onData: (data: Buffer) => void; signal?: AbortSignal; timeout?: number }) {
+		return this.engine.execShell(command, cwd, options);
+	}
+	execChecked(args: string[], options: ExecOptions = {}) { return this.engine.execChecked(args, options); }
+	execCode(args: string[], options: ExecOptions = {}) { return this.engine.execCode(args, options); }
+	shutdown(ctx?: ExtensionContext, explicitStop = false) { return this.engine.shutdown(ctx, explicitStop); }
+	getName() { return this.engine.getName(); }
+}
+
+class SandboxWorkspaceComponent {
+	constructor(private readonly engine: SandboxEngine) {}
+	configure(ctx: ExtensionContext) { this.engine.configure(ctx); }
+	isEnabled() { return this.engine.isEnabled(); }
+	getConfig() { return this.engine.getConfig(); }
+	getGitRefState() { return this.engine.getGitRefState(); }
+	hasPendingRebase() { return this.engine.hasPendingRebase(); }
+	restoreGitRefState(ctx: ExtensionContext) { this.engine.restoreGitRefState(ctx); }
+	preflight(ctx: ExtensionContext) { return this.engine.preflight(ctx); }
+	getPreflightError() { return this.engine.getPreflightError(); }
+	assertReadyForAgentTurn() { return this.engine.assertReadyForAgentTurn(); }
+}
+
+class SandboxCheckpointComponent {
+	constructor(private readonly engine: SandboxEngine) {}
+	checkpoint(ctx?: ExtensionContext) { return this.engine.checkpoint(ctx); }
+	autoCheckpoint(ctx?: ExtensionContext) { return this.engine.autoCheckpointSandboxChanges(ctx); }
+}
+
+class SandboxRebaseComponent {
+	constructor(private readonly engine: SandboxEngine) {}
+	start(ctx?: ExtensionContext) { return this.engine.rebaseHost(ctx); }
+	status() { return this.engine.rebaseStatus(); }
+	abort(ctx?: ExtensionContext) { return this.engine.abortRebase(ctx); }
+	finalize(ctx?: ExtensionContext) { return this.engine.finalizePendingRebase(ctx); }
+}
+
+class SandboxReviewComponent {
+	constructor(private readonly engine: SandboxEngine) {}
+	latestSnapshot(ctx?: ExtensionContext) { return this.engine.latestReviewSnapshot(ctx); }
+	commitSnapshot(commit: string, ctx?: ExtensionContext) { return this.engine.commitReviewSnapshot(commit, ctx); }
+	snapshot(base: string, tip: string, ctx?: ExtensionContext) { return this.engine.reviewSnapshot(base, tip, ctx); }
+	log(maxCount: number, ctx?: ExtensionContext) { return this.engine.reviewLog(maxCount, ctx); }
+	file(commit: string, filePath: string, ctx?: ExtensionContext) { return this.engine.reviewFile(commit, filePath, ctx); }
+}
+
+class ContainerSandbox {
+	readonly lifecycle: SandboxLifecycleComponent;
+	readonly workspace: SandboxWorkspaceComponent;
+	readonly checkpoints: SandboxCheckpointComponent;
+	readonly rebase: SandboxRebaseComponent;
+	readonly review: SandboxReviewComponent;
+
+	constructor(pi: ExtensionAPI) {
+		const engine = new SandboxEngine(pi);
+		this.lifecycle = new SandboxLifecycleComponent(engine);
+		this.workspace = new SandboxWorkspaceComponent(engine);
+		this.checkpoints = new SandboxCheckpointComponent(engine);
+		this.rebase = new SandboxRebaseComponent(engine);
+		this.review = new SandboxReviewComponent(engine);
+	}
+}
 
 export default function (pi: ExtensionAPI) {
 	pi.registerFlag("no-sandbox", { description: "Disable container sandbox tool backend", type: "boolean", default: false });
@@ -2067,24 +2265,31 @@ export default function (pi: ExtensionAPI) {
 	pi.registerFlag("sandbox-checkpoint-frequency", { description: "Automatic checkpoint boundary: turn, agent, or settled", type: "string" });
 	pi.registerFlag("sandbox-git-clone-depth", { description: "Host local clone depth for new sandboxes: 1 shallow default, 0 full history", type: "string" });
 	pi.registerFlag("sandbox-install-deps", { description: "Dependency bootstrap: auto or never", type: "string" });
-	pi.registerFlag("sandbox-auto-remove", { description: "Remove the sandbox container after shutdown instead of preserving it for reuse", type: "boolean", default: false });
+	pi.registerFlag("sandbox-lifecycle", { description: "Container lifecycle after session shutdown: remove, stopped, or running", type: "string" });
 	pi.registerFlag("sandbox-env", { description: "Comma-separated host env vars to pass into sandbox commands", type: "string" });
 
 	const sandbox = new ContainerSandbox(pi);
 
-	const localRead = createReadTool(process.cwd());
-	const localWrite = createWriteTool(process.cwd());
-	const localEdit = createEditTool(process.cwd());
-	const localBash = createBashTool(process.cwd());
-	const localLs = createLsTool(process.cwd());
-	const localFind = createFindTool(process.cwd());
-	const localGrep = createGrepTool(process.cwd());
-
-	function readOps(ctx: ExtensionContext): ReadOperations {
+	function routedTool<TParams extends TSchema, TDetails>(
+		localFactory: (cwd: string) => ToolDefinition<TParams, TDetails>,
+		sandboxFactory: (cwd: string) => ToolDefinition<TParams, TDetails>,
+	): ToolDefinition<TParams, TDetails> {
+		const base = localFactory(process.cwd());
 		return {
-			readFile: async (filePath) => (await sandbox.execChecked(["cat", "--", filePath])).stdout,
+			...base,
+			async execute(id, params, signal, onUpdate, ctx) {
+				sandbox.workspace.configure(ctx);
+				const tool = sandbox.workspace.isEnabled() ? sandboxFactory(ctx.cwd) : localFactory(ctx.cwd);
+				return tool.execute(id, params, signal, onUpdate, ctx);
+			},
+		};
+	}
+
+	function readOps(): ReadOperations {
+		return {
+			readFile: async (filePath) => (await sandbox.lifecycle.execChecked(["cat", "--", filePath])).stdout,
 			access: async (filePath) => {
-				await sandbox.execChecked(["test", "-r", filePath]);
+				await sandbox.lifecycle.execChecked(["test", "-r", filePath]);
 			},
 			detectImageMimeType: async (filePath) => {
 				const ext = path.extname(filePath).toLowerCase();
@@ -2098,58 +2303,58 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
-	function writeOps(ctx: ExtensionContext): WriteOperations {
+	function writeOps(): WriteOperations {
 		return {
 			writeFile: async (filePath, content) => {
-				await sandbox.execChecked(["sh", "-c", "cat > \"$1\"", "sh", filePath], { input: content });
+				await sandbox.lifecycle.execChecked(["sh", "-c", "cat > \"$1\"", "sh", filePath], { input: content });
 			},
 			mkdir: async (dir) => {
-				await sandbox.execChecked(["mkdir", "-p", dir]);
+				await sandbox.lifecycle.execChecked(["mkdir", "-p", dir]);
 			},
 		};
 	}
 
-	function editOps(ctx: ExtensionContext): EditOperations {
-		const r = readOps(ctx);
-		const w = writeOps(ctx);
+	function editOps(): EditOperations {
+		const r = readOps();
+		const w = writeOps();
 		return {
 			readFile: r.readFile,
 			writeFile: w.writeFile,
 			access: async (filePath) => {
-				await sandbox.execChecked(["test", "-r", filePath]);
-				await sandbox.execChecked(["test", "-w", filePath]);
+				await sandbox.lifecycle.execChecked(["test", "-r", filePath]);
+				await sandbox.lifecycle.execChecked(["test", "-w", filePath]);
 			},
 		};
 	}
 
-	function bashOps(ctx: ExtensionContext): BashOperations {
+	function bashOps(): BashOperations {
 		return {
-			exec: async (command, cwd, options) => sandbox.execShell(command, cwd, options),
+			exec: async (command, cwd, options) => sandbox.lifecycle.execShell(command, cwd, options),
 		};
 	}
 
-	function lsOps(ctx: ExtensionContext): LsOperations {
+	function lsOps(): LsOperations {
 		return {
-			exists: async (filePath) => (await sandbox.execCode(["test", "-e", filePath])).code === 0,
+			exists: async (filePath) => (await sandbox.lifecycle.execCode(["test", "-e", filePath])).code === 0,
 			stat: async (filePath) => {
-				const exists = (await sandbox.execCode(["test", "-e", filePath])).code === 0;
+				const exists = (await sandbox.lifecycle.execCode(["test", "-e", filePath])).code === 0;
 				if (!exists) throw new Error(`Path not found: ${filePath}`);
-				const isDir = (await sandbox.execCode(["test", "-d", filePath])).code === 0;
+				const isDir = (await sandbox.lifecycle.execCode(["test", "-d", filePath])).code === 0;
 				return { isDirectory: () => isDir };
 			},
 			readdir: async (dirPath) => {
-				const out = await sandbox.execChecked(["sh", "-c", "ls -A1 -- \"$1\"", "sh", dirPath]);
+				const out = await sandbox.lifecycle.execChecked(["sh", "-c", "ls -A1 -- \"$1\"", "sh", dirPath]);
 				const value = out.stdout.toString();
 				return value.trim() ? value.replace(/\r/g, "").split("\n") : [];
 			},
 		};
 	}
 
-	function findOps(ctx: ExtensionContext): FindOperations {
+	function findOps(): FindOperations {
 		return {
-			exists: async (filePath) => (await sandbox.execCode(["test", "-e", filePath])).code === 0,
+			exists: async (filePath) => (await sandbox.lifecycle.execCode(["test", "-e", filePath])).code === 0,
 			glob: async (pattern, searchPath, options) => {
-				const out = await sandbox.execChecked([
+				const out = await sandbox.lifecycle.execChecked([
 					"find",
 					searchPath,
 					"-path",
@@ -2192,12 +2397,12 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
-	function finalAssistantText(messages: readonly any[]): string {
+	function finalAssistantText(messages: readonly AgentMessage[]): string {
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const message = messages[i];
-			if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+			if (message.role !== "assistant") continue;
 			const output = message.content
-				.filter((part: any): part is TextContent => part?.type === "text")
+				.filter((part): part is TextContent => part.type === "text")
 				.map((part: TextContent) => part.text)
 				.join("\n")
 				.trim();
@@ -2260,14 +2465,14 @@ export default function (pi: ExtensionAPI) {
 
 	async function initialReviewSnapshot(ctx: ExtensionContext, instructions: string): Promise<{ snapshot: ReviewSnapshot; scopePinned: boolean }> {
 		const commitMatch = instructions.match(/\bcommit(?:\s+hash)?\s+([0-9a-f]{7,40})\b/i);
-		if (commitMatch) return { snapshot: await sandbox.commitReviewSnapshot(commitMatch[1], ctx), scopePinned: true };
+		if (commitMatch) return { snapshot: await sandbox.review.commitSnapshot(commitMatch[1], ctx), scopePinned: true };
 		const recentMatch = instructions.match(/\blast\s+(\d+)\s+commits?\b/i);
 		if (recentMatch) {
 			const count = Number(recentMatch[1]);
 			if (!Number.isSafeInteger(count) || count < 1 || count > 100) throw new Error("Review commit count must be between 1 and 100");
-			return { snapshot: await sandbox.reviewSnapshot(`HEAD~${count}`, "HEAD", ctx), scopePinned: true };
+			return { snapshot: await sandbox.review.snapshot(`HEAD~${count}`, "HEAD", ctx), scopePinned: true };
 		}
-		return { snapshot: await sandbox.latestReviewSnapshot(ctx), scopePinned: false };
+		return { snapshot: await sandbox.review.latestSnapshot(ctx), scopePinned: false };
 	}
 
 	async function runSandboxReview(
@@ -2275,13 +2480,13 @@ export default function (pi: ExtensionAPI) {
 		instructions = "",
 		onProgress?: (progress: SandboxReviewProgress) => void,
 	): Promise<SandboxReviewResult> {
-		sandbox.configure(ctx);
-		if (!sandbox.isEnabled()) throw new Error("Sandbox review requires the container sandbox to be enabled");
+		sandbox.workspace.configure(ctx);
+		if (!sandbox.workspace.isEnabled()) throw new Error("Sandbox review requires the container sandbox to be enabled");
 		const cleanInstructions = instructions.trim();
 		const initialReview = await initialReviewSnapshot(ctx, cleanInstructions);
 		let snapshot = initialReview.snapshot;
 		const pinnedRange = initialReview.scopePinned ? `${snapshot.baseCommit}..${snapshot.tipCommit}` : undefined;
-		const config = sandbox.getConfig().review;
+		const config = sandbox.workspace.getConfig().review;
 		const requestedModel = config.model;
 		let model = ctx.model;
 		let thinkingLevel = config.thinkingLevel;
@@ -2339,7 +2544,7 @@ export default function (pi: ExtensionAPI) {
 				maxCount: Type.Optional(Type.Number({ description: "Number of recent commits to list (default 20, maximum 100)" })),
 			}),
 			execute: async (_id, params) => ({
-				content: [{ type: "text", text: await sandbox.reviewLog(params.maxCount ?? 20, ctx) }],
+				content: [{ type: "text", text: await sandbox.review.log(params.maxCount ?? 20, ctx) }],
 				details: {},
 			}),
 		});
@@ -2349,11 +2554,11 @@ export default function (pi: ExtensionAPI) {
 			description: "Read a tracked file exactly as it exists at the currently selected review base or tip commit.",
 			parameters: Type.Object({
 				path: Type.String({ description: "Repository-relative file path" }),
-				version: Type.Optional(Type.Union([Type.Literal("base"), Type.Literal("tip")], { description: "Read from the base or tip (default tip)" })),
+				version: Type.Optional(StringEnum(["base", "tip"] as const, { description: "Read from the base or tip (default tip)" })),
 			}),
 			execute: async (_id, params) => {
 				const commit = params.version === "base" ? snapshot.baseCommit : snapshot.tipCommit;
-				const file = truncateHead(await sandbox.reviewFile(commit, params.path, ctx), {
+				const file = truncateHead(await sandbox.review.file(commit, params.path, ctx), {
 					maxLines: Number.MAX_SAFE_INTEGER,
 					maxBytes: config.maxDiffBytes,
 				});
@@ -2367,7 +2572,7 @@ export default function (pi: ExtensionAPI) {
 			description: "Load the patch for one sandbox commit against its first parent. Short hashes are accepted when unambiguous.",
 			parameters: Type.Object({ commit: Type.String({ description: "Commit hash or revision to review" }) }),
 			execute: async (_id, params) => {
-				const requestedSnapshot = await sandbox.commitReviewSnapshot(params.commit, ctx);
+				const requestedSnapshot = await sandbox.review.commitSnapshot(params.commit, ctx);
 				const requestedRange = `${requestedSnapshot.baseCommit}..${requestedSnapshot.tipCommit}`;
 				if (pinnedRange && requestedRange !== pinnedRange) throw new Error(`Review scope is pinned to ${pinnedRange}`);
 				snapshot = requestedSnapshot;
@@ -2383,7 +2588,7 @@ export default function (pi: ExtensionAPI) {
 				tip: Type.Optional(Type.String({ description: "Tip revision (default HEAD)" })),
 			}),
 			execute: async (_id, params) => {
-				const requestedSnapshot = await sandbox.reviewSnapshot(params.base, params.tip ?? "HEAD", ctx);
+				const requestedSnapshot = await sandbox.review.snapshot(params.base, params.tip ?? "HEAD", ctx);
 				const requestedRange = `${requestedSnapshot.baseCommit}..${requestedSnapshot.tipCommit}`;
 				if (pinnedRange && requestedRange !== pinnedRange) throw new Error(`Review scope is pinned to ${pinnedRange}`);
 				snapshot = requestedSnapshot;
@@ -2391,14 +2596,14 @@ export default function (pi: ExtensionAPI) {
 			},
 		});
 		const customTools = [
-			createReadTool(ctx.cwd, { operations: readOps(ctx) }),
-			createFindTool(ctx.cwd, { operations: findOps(ctx) }),
-			createLsTool(ctx.cwd, { operations: lsOps(ctx) }),
+			createReadToolDefinition(ctx.cwd, { operations: readOps() }),
+			createFindToolDefinition(ctx.cwd, { operations: findOps() }),
+			createLsToolDefinition(ctx.cwd, { operations: lsOps() }),
 			reviewLogTool,
 			reviewReadTool,
 			reviewCommitTool,
 			reviewDiffTool,
-		] as unknown as ToolDefinition[];
+		];
 		const settingsManager = SettingsManager.inMemory({
 			compaction: { enabled: false },
 			retry: { enabled: true, maxRetries: 1 },
@@ -2414,7 +2619,7 @@ export default function (pi: ExtensionAPI) {
 			sessionManager: SessionManager.inMemory(ctx.cwd),
 			settingsManager,
 		});
-		const unsubscribe = session.subscribe((event: any) => {
+		const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
 			switch (event.type) {
 				case "agent_start":
 					setProgressPhase("Reviewer started");
@@ -2457,10 +2662,10 @@ export default function (pi: ExtensionAPI) {
 			let toolCalls = 0;
 			let inputTokens = 0;
 			let outputTokens = 0;
-			for (const message of session.messages as any[]) {
-				if (message?.role !== "assistant") continue;
+			for (const message of session.messages) {
+				if (message.role !== "assistant") continue;
 				turns++;
-				toolCalls += Array.isArray(message.content) ? message.content.filter((part: any) => part?.type === "toolCall").length : 0;
+				toolCalls += message.content.filter((part) => part.type === "toolCall").length;
 				inputTokens += message.usage?.input ?? 0;
 				outputTokens += message.usage?.output ?? 0;
 			}
@@ -2519,27 +2724,27 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		sandbox.configure(ctx);
-		if (sandbox.getConfig().commitTarget === "current-branch" && sandbox.getConfig().sandboxName.trim()) {
+		sandbox.workspace.configure(ctx);
+		if (sandbox.workspace.getConfig().commitTarget === "current-branch" && sandbox.workspace.getConfig().sandboxName.trim()) {
 			ctx.ui.notify("sandboxName is ignored when commitTarget=current-branch; the container is named from the repository and branch", "warning");
 		}
-		sandbox.restoreGitRefState(ctx);
-		await sandbox.preflight(ctx);
-		if (sandbox.isEnabled()) {
+		sandbox.workspace.restoreGitRefState(ctx);
+		await sandbox.workspace.preflight(ctx);
+		if (sandbox.workspace.isEnabled()) {
 			ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("muted", "sandbox: pending"));
 		}
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		sandbox.configure(ctx);
-		if (!sandbox.isEnabled()) return;
-		await sandbox.preflight(ctx);
-		if (sandbox.getPreflightError()) throw new Error(`Sandbox unavailable: ${sandbox.getPreflightError()}`);
-		let config = sandbox.getConfig();
-		await sandbox.ensure(ctx);
-		await sandbox.assertReadyForAgentTurn();
-		config = sandbox.getConfig();
-		const gitRefState = sandbox.getGitRefState();
+		sandbox.workspace.configure(ctx);
+		if (!sandbox.workspace.isEnabled()) return;
+		await sandbox.workspace.preflight(ctx);
+		if (sandbox.workspace.getPreflightError()) throw new Error(`Sandbox unavailable: ${sandbox.workspace.getPreflightError()}`);
+		let config = sandbox.workspace.getConfig();
+		await sandbox.lifecycle.ensure(ctx);
+		await sandbox.workspace.assertReadyForAgentTurn();
+		config = sandbox.workspace.getConfig();
+		const gitRefState = sandbox.workspace.getGitRefState();
 		const checkpointBoundary = config.checkpointFrequency === "turn"
 			? "internal model turn"
 			: config.checkpointFrequency === "agent"
@@ -2549,7 +2754,7 @@ export default function (pi: ExtensionAPI) {
 			? ` After each ${checkpointBoundary}, sandbox changes receive an AI-generated commit message and fast-forward the checked-out host branch ${gitRefState?.baseBranch ?? ""}; the host worktree is updated after validation.`
 			: ` After each ${checkpointBoundary}, sandbox changes receive an AI-generated commit message and are imported through a validated, hard-coded checkpoint operation into host ref ${gitRefState?.sandboxRef ?? `${GIT_REF_NAMESPACE}/...`}; the checked-out host branch/worktree is not modified.`;
 		const gitNote = `${destinationNote} Host-untracked files are handled with hostUntrackedFiles=${config.hostUntrackedFiles}.`;
-		const rebaseNote = sandbox.hasPendingRebase()
+		const rebaseNote = sandbox.workspace.hasPendingRebase()
 			? " A sandbox rebase is currently pending. Normal automatic checkpoints are paused. Resolve any conflicts inside the container, stage them, run GIT_EDITOR=true git rebase --continue until complete, and leave the tracked worktree clean; never attempt to modify the host ref directly."
 			: "";
 		return {
@@ -2562,18 +2767,18 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
-		if (sandbox.getConfig().checkpointFrequency === "turn") await sandbox.autoCheckpointSandboxChanges(ctx);
+		if (sandbox.workspace.getConfig().checkpointFrequency === "turn") await sandbox.checkpoints.checkpoints.autoCheckpoint(ctx);
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
-		if (sandbox.getConfig().checkpointFrequency === "agent") await sandbox.autoCheckpointSandboxChanges(ctx);
+		if (sandbox.workspace.getConfig().checkpointFrequency === "agent") await sandbox.checkpoints.checkpoints.autoCheckpoint(ctx);
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
-		if (sandbox.getConfig().checkpointFrequency === "settled") await sandbox.autoCheckpointSandboxChanges(ctx);
-		if (!sandbox.hasPendingRebase()) return;
+		if (sandbox.workspace.getConfig().checkpointFrequency === "settled") await sandbox.checkpoints.checkpoints.autoCheckpoint(ctx);
+		if (!sandbox.workspace.hasPendingRebase()) return;
 		try {
-			const result = await sandbox.finalizePendingRebase(ctx);
+			const result = await sandbox.rebase.finalize(ctx);
 			if (result.completed) ctx.ui.notify(result.message, "info");
 			else ctx.ui.notify(result.message, "warning");
 		} catch (error) {
@@ -2582,38 +2787,31 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		await sandbox.shutdown(ctx);
+		await sandbox.lifecycle.shutdown(ctx);
 	});
 
 	pi.on("user_bash", async (_event, ctx) => {
-		sandbox.configure(ctx);
-		if (!sandbox.isEnabled()) return;
-		await sandbox.ensure(ctx);
-		return { operations: bashOps(ctx) };
+		sandbox.workspace.configure(ctx);
+		if (!sandbox.workspace.isEnabled()) return;
+		return { operations: bashOps() };
 	});
 
-	pi.registerTool({
-		...localRead,
-		async execute(id, params, signal, onUpdate, ctx) {
-			sandbox.configure(ctx);
-			if (!sandbox.isEnabled()) return createReadTool(ctx.cwd).execute(id, params, signal, onUpdate);
-			await sandbox.ensure(ctx);
-			return createReadTool(ctx.cwd, { operations: readOps(ctx) }).execute(id, params, signal, onUpdate);
-		},
-	});
+	pi.registerTool(routedTool(
+		(cwd) => createReadToolDefinition(cwd),
+		(cwd) => createReadToolDefinition(cwd, { operations: readOps() }),
+	));
 
-	pi.registerTool({
-		...localWrite,
-		async execute(id, params, signal, onUpdate, ctx) {
-			sandbox.configure(ctx);
-			if (!sandbox.isEnabled()) return createWriteTool(ctx.cwd).execute(id, params, signal, onUpdate);
-			await sandbox.ensure(ctx);
-			return createWriteTool(ctx.cwd, { operations: writeOps(ctx) }).execute(id, params, signal, onUpdate);
-		},
-	});
+	pi.registerTool(routedTool(
+		(cwd) => createWriteToolDefinition(cwd),
+		(cwd) => createWriteToolDefinition(cwd, { operations: writeOps() }),
+	));
 
+	const editTool = routedTool(
+		(cwd) => createEditToolDefinition(cwd),
+		(cwd) => createEditToolDefinition(cwd, { operations: editOps() }),
+	);
 	pi.registerTool({
-		...localEdit,
+		...editTool,
 		renderCall(args, theme) {
 			// Avoid the built-in edit preview renderer here: it reads the host file to
 			// compute a preview. The actual edit execution and result diff still happen
@@ -2627,52 +2825,29 @@ export default function (pi: ExtensionAPI) {
 				0,
 			);
 		},
-		async execute(id, params, signal, onUpdate, ctx) {
-			sandbox.configure(ctx);
-			if (!sandbox.isEnabled()) return createEditTool(ctx.cwd).execute(id, params, signal, onUpdate);
-			await sandbox.ensure(ctx);
-			const result = await createEditTool(ctx.cwd, { operations: editOps(ctx) }).execute(id, params, signal, onUpdate);
-			return result;
-		},
 	});
 
-	pi.registerTool({
-		...localBash,
-		async execute(id, params, signal, onUpdate, ctx) {
-			sandbox.configure(ctx);
-			if (!sandbox.isEnabled()) return createBashTool(ctx.cwd).execute(id, params, signal, onUpdate);
-			await sandbox.ensure(ctx);
-			return createBashTool(ctx.cwd, { operations: bashOps(ctx) }).execute(id, params, signal, onUpdate);
-		},
-	});
+	pi.registerTool(routedTool(
+		(cwd) => createBashToolDefinition(cwd),
+		(cwd) => createBashToolDefinition(cwd, { operations: bashOps() }),
+	));
 
-	pi.registerTool({
-		...localLs,
-		async execute(id, params, signal, onUpdate, ctx) {
-			sandbox.configure(ctx);
-			if (!sandbox.isEnabled()) return createLsTool(ctx.cwd).execute(id, params, signal, onUpdate);
-			await sandbox.ensure(ctx);
-			return createLsTool(ctx.cwd, { operations: lsOps(ctx) }).execute(id, params, signal, onUpdate);
-		},
-	});
+	pi.registerTool(routedTool(
+		(cwd) => createLsToolDefinition(cwd),
+		(cwd) => createLsToolDefinition(cwd, { operations: lsOps() }),
+	));
 
-	pi.registerTool({
-		...localFind,
-		async execute(id, params, signal, onUpdate, ctx) {
-			sandbox.configure(ctx);
-			if (!sandbox.isEnabled()) return createFindTool(ctx.cwd).execute(id, params, signal, onUpdate);
-			await sandbox.ensure(ctx);
-			return createFindTool(ctx.cwd, { operations: findOps(ctx) }).execute(id, params, signal, onUpdate);
-		},
-	});
+	pi.registerTool(routedTool(
+		(cwd) => createFindToolDefinition(cwd),
+		(cwd) => createFindToolDefinition(cwd, { operations: findOps() }),
+	));
 
+	const localGrep = createGrepToolDefinition(process.cwd());
 	pi.registerTool({
 		...localGrep,
-		parameters: grepSchema,
 		async execute(id, params, signal, onUpdate, ctx) {
-			sandbox.configure(ctx);
-			if (!sandbox.isEnabled()) return createGrepTool(ctx.cwd).execute(id, params, signal, onUpdate);
-			await sandbox.ensure(ctx);
+			sandbox.workspace.configure(ctx);
+			if (!sandbox.workspace.isEnabled()) return createGrepToolDefinition(ctx.cwd).execute(id, params, signal, onUpdate, ctx);
 			const searchPath = resolveToolPath(ctx.cwd, params.path || ".");
 			const args = [
 				"rg",
@@ -2691,11 +2866,11 @@ export default function (pi: ExtensionAPI) {
 			if (params.context && params.context > 0) args.push("-C", String(params.context));
 			args.push("--", params.pattern, searchPath);
 
-			const result = await sandbox.execCode(args, { signal, timeoutMs: 120_000 });
+			const result = await sandbox.lifecycle.execCode(args, { signal, timeoutMs: 120_000 });
 			if (result.code === 1) return { content: text("No matches found"), details: undefined };
 			if (result.code !== 0) throw new Error(result.stderr.toString().trim() || `ripgrep exited with ${result.code}`);
 
-			const isDir = (await sandbox.execCode(["test", "-d", searchPath])).code === 0;
+			const isDir = (await sandbox.lifecycle.execCode(["test", "-d", searchPath])).code === 0;
 			const rootPrefix = isDir ? searchPath.replace(/\/$/, "") + "/" : path.dirname(searchPath).replace(/\/$/, "") + "/";
 			let lines = result.stdout
 				.toString()
@@ -2726,105 +2901,109 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("sandbox", {
 		description: "Show or control the container sandbox (status|checkpoint|review|rebase|rebase-status|rebase-abort|stop)",
 		handler: async (args, ctx) => {
-			sandbox.configure(ctx);
-			const [command = "", ...commandArgs] = args.trim().split(/\s+/);
-			if (command === "checkpoint") {
-				const result = await sandbox.checkpoint(ctx);
-				ctx.ui.notify(result.message, "info");
-				return;
-			}
-			if (command === "review") {
-				const reviewInstructions = (commandArgs[0] === "--" ? commandArgs.slice(1) : commandArgs).join(" ").trim();
-				ctx.ui.setStatus("sandbox-review", ctx.ui.theme.fg("accent", "reviewing sandbox"));
-				try {
-					const result = await runSandboxReview(ctx, reviewInstructions, (progress) => showReviewProgressWidget(ctx, progress));
-					pi.sendMessage({
-						customType: "container-sandbox.review",
-						content: result.report,
-						display: true,
-						details: {
-							model: result.model,
-							thinkingLevel: result.thinkingLevel,
-							instructions: result.instructions,
-							baseCommit: result.baseCommit,
-							tipCommit: result.tipCommit,
-							changedFiles: result.changedFiles,
-							diffStat: result.diffStat,
-							patchTruncated: result.patchTruncated,
-							turns: result.turns,
-							toolCalls: result.toolCalls,
-							inputTokens: result.inputTokens,
-							outputTokens: result.outputTokens,
-							activities: result.activities,
-						},
-					});
-					ctx.ui.notify(`Sandbox review completed with ${result.model}`, "info");
-				} finally {
-					ctx.ui.setStatus("sandbox-review", undefined);
-					ctx.ui.setWidget("sandbox-review-progress", undefined);
-				}
-				return;
-			}
-			if (command === "rebase") {
-				const result = await sandbox.rebaseHost(ctx);
-				ctx.ui.notify(result.message, result.conflicted ? "warning" : "info");
-				if (result.conflicted) {
-					const listed = result.conflictFiles?.length ? `\n\nConflicted files:\n${result.conflictFiles.map((file) => `- ${file}`).join("\n")}` : "";
-					pi.sendUserMessage(
-						"A sandbox rebase onto the latest host base branch is paused by conflicts. Resolve the conflicts entirely inside the container. " +
-						"Inspect both sides and preserve the intent of the feature and upstream changes. Stage each resolved file with git add, then run " +
-						"GIT_EDITOR=true git rebase --continue. Repeat until the rebase completes, run appropriate tests, and leave no tracked changes. " +
-						"Do not use blanket ours/theirs resolution and do not abort the rebase." +
-						listed,
+			sandbox.workspace.configure(ctx);
+			const [rawCommand = "", ...commandArgs] = args.trim().split(/\s+/);
+			const command = rawCommand || "status";
+			if (["checkpoint", "review", "rebase", "rebase-abort", "stop"].includes(command)) await ctx.waitForIdle();
+
+			switch (command) {
+				case "status": {
+					const config = sandbox.workspace.getConfig();
+					const gitRefState = sandbox.workspace.getGitRefState();
+					ctx.ui.notify(
+						[
+							`Container sandbox: ${sandbox.workspace.isEnabled() ? "enabled" : "disabled by --no-sandbox"}`,
+							`Runtime: ${config.runtime}`,
+							`Image: ${config.image}`,
+							`Commit target: ${config.commitTarget}`,
+							`Checkpoint frequency: ${config.checkpointFrequency}`,
+							`Git ref namespace: ${GIT_REF_NAMESPACE} (sandbox-ref target)`,
+							`Git clone depth: ${config.gitCloneDepth === 0 ? "full" : config.gitCloneDepth}`,
+							`Host untracked files: ${config.hostUntrackedFiles}`,
+							`Sandbox ref: ${gitRefState?.sandboxRef ?? "(not initialized)"}`,
+							`Sandbox name: ${config.commitTarget === "current-branch" ? "(ignored)" : config.sandboxName || "(session id)"}`,
+							`Active container: ${sandbox.lifecycle.getName() ?? "not started"}`,
+							`Install deps on reuse: ${config.installDepsOnReuse}`,
+							`Install deps: ${config.installDeps}`,
+							`Container lifecycle: ${config.lifecycle}`,
+							`Package cache mount: ${config.runtime} bind ${path.join(getAgentDir(), "cache", "container-sandbox", "packages")} -> ${PACKAGE_CACHE_ROOT}`,
+							`Rebase pending: ${sandbox.workspace.hasPendingRebase()}`,
+							`Review model: ${config.review.model || "(current session model)"}`,
+							`Review thinking: ${config.review.thinkingLevel}`,
+							`Review max diff: ${formatSize(config.review.maxDiffBytes)}`,
+							`Git commit co-author: ${config.gitCommitCoAuthor || "(none)"}`,
+							`Pass env: ${config.passEnv.length ? config.passEnv.join(", ") : "(none)"}`,
+						].join("\n"),
+						"info",
 					);
+					return;
 				}
-				return;
+				case "checkpoint": {
+					const result = await sandbox.checkpoints.checkpoint(ctx);
+					ctx.ui.notify(result.message, "info");
+					return;
+				}
+				case "review": {
+					const reviewInstructions = (commandArgs[0] === "--" ? commandArgs.slice(1) : commandArgs).join(" ").trim();
+					ctx.ui.setStatus("sandbox-review", ctx.ui.theme.fg("accent", "reviewing sandbox"));
+					try {
+						const result = await runSandboxReview(ctx, reviewInstructions, (progress) => showReviewProgressWidget(ctx, progress));
+						pi.sendMessage({
+							customType: "container-sandbox.review",
+							content: result.report,
+							display: true,
+							details: {
+								model: result.model,
+								thinkingLevel: result.thinkingLevel,
+								instructions: result.instructions,
+								baseCommit: result.baseCommit,
+								tipCommit: result.tipCommit,
+								changedFiles: result.changedFiles,
+								diffStat: result.diffStat,
+								patchTruncated: result.patchTruncated,
+								turns: result.turns,
+								toolCalls: result.toolCalls,
+								inputTokens: result.inputTokens,
+								outputTokens: result.outputTokens,
+								activities: result.activities,
+							},
+						});
+						ctx.ui.notify(`Sandbox review completed with ${result.model}`, "info");
+					} finally {
+						ctx.ui.setStatus("sandbox-review", undefined);
+						ctx.ui.setWidget("sandbox-review-progress", undefined);
+					}
+					return;
+				}
+				case "rebase": {
+					const result = await sandbox.rebase.start(ctx);
+					ctx.ui.notify(result.message, result.conflicted ? "warning" : "info");
+					if (result.conflicted) {
+						const listed = result.conflictFiles?.length ? `\n\nConflicted files:\n${result.conflictFiles.map((file) => `- ${file}`).join("\n")}` : "";
+						pi.sendUserMessage(
+							"A sandbox rebase onto the latest host base branch is paused by conflicts. Resolve the conflicts entirely inside the container. " +
+							"Inspect both sides and preserve the intent of the feature and upstream changes. Stage each resolved file with git add, then run " +
+							"GIT_EDITOR=true git rebase --continue. Repeat until the rebase completes, run appropriate tests, and leave no tracked changes. " +
+							"Do not use blanket ours/theirs resolution and do not abort the rebase." +
+							listed,
+						);
+					}
+					return;
+				}
+				case "rebase-status": {
+					const result = await sandbox.rebase.status();
+					ctx.ui.notify(result.message, result.conflicted ? "warning" : "info");
+					return;
+				}
+				case "rebase-abort":
+					ctx.ui.notify(await sandbox.rebase.abort(ctx), "info");
+					return;
+				case "stop":
+					await sandbox.lifecycle.shutdown(ctx, true);
+					return;
+				default:
+					ctx.ui.notify(`Unknown sandbox command: ${command}`, "error");
 			}
-			if (command === "rebase-status") {
-				const result = await sandbox.rebaseStatus();
-				ctx.ui.notify(result.message, result.conflicted ? "warning" : "info");
-				return;
-			}
-			if (command === "rebase-abort") {
-				ctx.ui.notify(await sandbox.abortRebase(ctx), "info");
-				return;
-			}
-			if (command === "stop") {
-				await sandbox.shutdown(ctx);
-				return;
-			}
-			const config = sandbox.getConfig();
-			const gitRefState = sandbox.getGitRefState();
-			ctx.ui.notify(
-				[
-					`Container sandbox: ${sandbox.isEnabled() ? "enabled" : "disabled by --no-sandbox"}`,
-					`Runtime: ${config.runtime}`,
-					`Image: ${config.image}`,
-					`Commit target: ${config.commitTarget}`,
-					`Checkpoint frequency: ${config.checkpointFrequency}`,
-					`Git ref namespace: ${GIT_REF_NAMESPACE} (sandbox-ref target)`,
-					`Git clone depth: ${config.gitCloneDepth === 0 ? "full" : config.gitCloneDepth}`,
-					`Host untracked files: ${config.hostUntrackedFiles}`,
-					`Sandbox ref: ${gitRefState?.sandboxRef ?? "(not initialized)"}`,
-					`Sandbox name: ${config.commitTarget === "current-branch" ? "(ignored)" : config.sandboxName || "(session id)"}`,
-					`Active container: ${sandbox.getName() ?? "not started"}`,
-					`Install deps on reuse: ${config.installDepsOnReuse}`,
-					`Install deps: ${config.installDeps}`,
-					`Auto-remove container: ${config.autoRemove}`,
-					`Package cache mount: ${sandbox.getConfig().runtime} bind ${path.join(getAgentDir(), "cache", "container-sandbox", "packages")} -> ${PACKAGE_CACHE_ROOT}`,
-					`Host git tool: removed (no model-callable host commands)`,
-					`Git auto-commit: enabled (fixed)`,
-					`Rebase pending: ${sandbox.hasPendingRebase()}`,
-					`Review model: ${config.review.model || "(current session model)"}`,
-					`Review thinking: ${config.review.thinkingLevel}`,
-					`Review max diff: ${formatSize(config.review.maxDiffBytes)}`,
-					`Git commit message mode: AI with timestamp fallback (fixed)`,
-					`Git commit co-author: ${config.gitCommitCoAuthor || "(none)"}`,
-					`Fallback commit prefix: ${FALLBACK_COMMIT_PREFIX} (fixed)`,
-					`Pass env: ${config.passEnv.length ? config.passEnv.join(", ") : "(none)"}`,
-				].join("\n"),
-				"info",
-			);
 		},
 	});
 }
