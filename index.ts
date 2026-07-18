@@ -17,6 +17,8 @@
  *   --no-sandbox                         Disable this extension for one run
  *   --sandbox-runtime container|docker|podman
  *   --sandbox-image <image>               Image to use/build
+ *   --sandbox-docker-port-mode <mode>      disabled, dynamic, or fixed
+ *   --sandbox-docker-port-range <range>   Docker container ports to publish (default 8000-8010)
  *   --sandbox-name <name>                 Stable sandbox/ref name (container is derived)
  *   --sandbox-commit-target <target>       sandbox-ref or current-branch
  *   --sandbox-checkpoint-frequency <mode>  turn, agent, or settled
@@ -159,10 +161,14 @@ interface ReviewConfig {
 }
 
 type ContainerRuntime = "container" | "docker" | "podman";
+type DockerPortMode = "disabled" | "dynamic" | "fixed";
 
 interface SandboxConfig {
 	runtime: ContainerRuntime;
 	image: string;
+	dockerPortMode: DockerPortMode;
+	dockerPortRange: string;
+	hostGateway: string;
 	sandboxName: string;
 	commitTarget: CommitTarget;
 	checkpointFrequency: CheckpointFrequency;
@@ -193,6 +199,9 @@ const PACKAGE_CACHE_ENV: Record<string, string> = {
 const DEFAULT_CONFIG: SandboxConfig = {
 	runtime: "container",
 	image: DEFAULT_IMAGE,
+	dockerPortMode: "dynamic",
+	dockerPortRange: "8000-8010",
+	hostGateway: "",
 	sandboxName: "",
 	commitTarget: "sandbox-ref",
 	checkpointFrequency: "turn",
@@ -236,6 +245,17 @@ interface ContainerInspectMount {
 	Destination?: string;
 }
 
+interface DockerPortBinding {
+	HostIp?: string;
+	HostPort?: string;
+}
+
+interface DockerPortMapping {
+	containerPort: number;
+	hostIp: string;
+	hostPort: number;
+}
+
 interface ContainerInspectData {
 	configuration?: {
 		image?: { reference?: string };
@@ -243,6 +263,7 @@ interface ContainerInspectData {
 		labels?: Record<string, string>;
 	};
 	Config?: { Image?: string; Labels?: Record<string, string> };
+	NetworkSettings?: { Ports?: Record<string, DockerPortBinding[] | null> };
 	ImageName?: string;
 	Mounts?: ContainerInspectMount[];
 	Labels?: Record<string, string>;
@@ -298,6 +319,45 @@ function configInteger(value: unknown, source: string, minimum = 0): number {
 	return value;
 }
 
+function configPortRange(value: unknown, source: string): string {
+	if (typeof value !== "string") throw new Error(`${source} must be a port or port range such as 8000-8010`);
+	const match = value.trim().match(/^(\d+)(?:-(\d+))?$/);
+	if (!match) throw new Error(`${source} must be a port or port range such as 8000-8010`);
+	const start = Number(match[1]);
+	const end = Number(match[2] ?? match[1]);
+	if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end > 65_535 || start > end) {
+		throw new Error(`${source} must contain ports from 1 through 65535 in ascending order`);
+	}
+	if (end - start + 1 > 100) throw new Error(`${source} must contain no more than 100 ports`);
+	return start === end ? String(start) : `${start}-${end}`;
+}
+
+function portsFromRange(value: string): number[] {
+	const [startText, endText = startText] = value.split("-");
+	const start = Number(startText);
+	const end = Number(endText);
+	return Array.from({ length: end - start + 1 }, (_, index) => start + index);
+}
+
+function formatDockerPortMappings(mappings: readonly DockerPortMapping[]): string {
+	return mappings.map((mapping) => `${mapping.containerPort} -> ${mapping.hostIp}:${mapping.hostPort}`).join(", ");
+}
+
+function configHostGateway(value: unknown, source: string): string {
+	if (typeof value !== "string") throw new Error(`${source} must be a hostname or an empty string`);
+	const hostname = value.trim();
+	if (!hostname) return "";
+	if (
+		hostname.length > 253 ||
+		!hostname.split(".").every((label) =>
+			label.length > 0 && label.length <= 63 && /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label),
+		)
+	) {
+		throw new Error(`${source} must be a valid hostname or an empty string`);
+	}
+	return hostname;
+}
+
 function configPassEnv(value: unknown, source: string): string[] {
 	const names = parseList(value);
 	if (!names) throw new Error(`${source} must be an array or comma-separated string`);
@@ -310,7 +370,7 @@ function configPassEnv(value: unknown, source: string): string[] {
 function validateConfig(value: unknown, source: string): SandboxConfigOverrides {
 	const raw = configRecord(value, source);
 	const allowed = new Set([
-		"runtime", "image", "sandboxName", "commitTarget", "checkpointFrequency", "installDepsOnReuse",
+		"runtime", "image", "dockerPortMode", "dockerPortRange", "hostGateway", "sandboxName", "commitTarget", "checkpointFrequency", "installDepsOnReuse",
 		"hostUntrackedFiles", "gitCloneDepth", "gitCommitCoAuthor", "gitCommitAiMaxDiffBytes", "installDeps",
 		"lifecycle", "passEnv", "review",
 	]);
@@ -322,6 +382,9 @@ function validateConfig(value: unknown, source: string): SandboxConfigOverrides 
 	const result: SandboxConfigOverrides = {};
 	if (raw.runtime !== undefined) result.runtime = configChoice(raw.runtime, ["container", "docker", "podman"] as const, `${source}.runtime`);
 	if (raw.image !== undefined) result.image = configString(raw.image, `${source}.image`, false).trim();
+	if (raw.dockerPortMode !== undefined) result.dockerPortMode = configChoice(raw.dockerPortMode, ["disabled", "dynamic", "fixed"] as const, `${source}.dockerPortMode`);
+	if (raw.dockerPortRange !== undefined) result.dockerPortRange = configPortRange(raw.dockerPortRange, `${source}.dockerPortRange`);
+	if (raw.hostGateway !== undefined) result.hostGateway = configHostGateway(raw.hostGateway, `${source}.hostGateway`);
 	if (raw.sandboxName !== undefined) result.sandboxName = configString(raw.sandboxName, `${source}.sandboxName`);
 	if (raw.commitTarget !== undefined) result.commitTarget = configChoice(raw.commitTarget, ["sandbox-ref", "current-branch"] as const, `${source}.commitTarget`);
 	if (raw.checkpointFrequency !== undefined) result.checkpointFrequency = configChoice(raw.checkpointFrequency, ["turn", "agent", "settled"] as const, `${source}.checkpointFrequency`);
@@ -378,6 +441,10 @@ function loadConfig(cwd: string, projectTrusted: boolean, pi: ExtensionAPI): San
 	if (runtime !== undefined) config.runtime = runtime;
 	const image = pi.getFlag("sandbox-image") as string | undefined;
 	if (image !== undefined) config.image = configString(image, "--sandbox-image", false).trim();
+	const dockerPortMode = cliChoice(pi, "sandbox-docker-port-mode", ["disabled", "dynamic", "fixed"] as const);
+	if (dockerPortMode !== undefined) config.dockerPortMode = dockerPortMode;
+	const dockerPortRange = pi.getFlag("sandbox-docker-port-range");
+	if (dockerPortRange !== undefined) config.dockerPortRange = configPortRange(dockerPortRange, "--sandbox-docker-port-range");
 	const sandboxName = pi.getFlag("sandbox-name") as string | undefined;
 	if (sandboxName !== undefined) config.sandboxName = configString(sandboxName, "--sandbox-name");
 	const commitTarget = cliChoice(pi, "sandbox-commit-target", ["sandbox-ref", "current-branch"] as const);
@@ -659,6 +726,7 @@ class SandboxEngine {
 	private depsInstalled = false;
 	private started = false;
 	private reusedContainer = false;
+	private dockerPortMappings: DockerPortMapping[] = [];
 	private gitRefState: GitRefState | undefined;
 	private pendingRebase: PendingRebase | undefined;
 	private preflightError: string | undefined;
@@ -678,6 +746,10 @@ class SandboxEngine {
 
 	getName() {
 		return this.containerName;
+	}
+
+	getDockerPortMappings() {
+		return this.dockerPortMappings.map((mapping) => ({ ...mapping }));
 	}
 
 	getConfig() {
@@ -1112,6 +1184,22 @@ class SandboxEngine {
 		return (await this.runtimeExec(["inspect", name], { timeoutMs: 10_000 })).code === 0;
 	}
 
+	private reusableContainerConfig(): Record<string, unknown> {
+		const config: Record<string, unknown> = {
+			image: this.config.image,
+			packageCache: this.packageCacheHostRoot(),
+		};
+		if (this.config.runtime === "docker") {
+			config.dockerPortMode = this.config.dockerPortMode;
+			if (this.config.dockerPortMode !== "disabled") {
+				config.dockerPortRange = this.config.dockerPortRange;
+				config.dockerBindAddress = "127.0.0.1";
+			}
+			config.hostGateway = this.config.hostGateway;
+		}
+		return config;
+	}
+
 	private containerLabels(state: GitRefState): Record<string, string> {
 		return {
 			"pi.container-sandbox.managed": "true",
@@ -1119,13 +1207,13 @@ class SandboxEngine {
 			"pi.container-sandbox.target": state.commitTarget,
 			"pi.container-sandbox.ref": createHash("sha256").update(state.sandboxRef).digest("hex").slice(0, 16),
 			"pi.container-sandbox.config": createHash("sha256")
-				.update(JSON.stringify({ image: this.config.image, packageCache: this.packageCacheHostRoot() }))
+				.update(JSON.stringify(this.reusableContainerConfig()))
 				.digest("hex")
 				.slice(0, 16),
 		};
 	}
 
-	private async validateExistingContainer(name: string, state: GitRefState) {
+	private async inspectContainer(name: string): Promise<ContainerInspectData> {
 		const inspected = await this.runtimeExecChecked(["inspect", name], { timeoutMs: 30_000, maxCaptureBytes: 2 * 1024 * 1024 });
 		if (inspected.stdoutTruncated) throw new Error(`Container metadata is too large to validate: ${name}`);
 		let parsed: unknown;
@@ -1135,7 +1223,13 @@ class SandboxEngine {
 			throw new Error(`Container runtime returned invalid metadata for ${name}`);
 		}
 		const item = (Array.isArray(parsed) ? parsed[0] : parsed) as ContainerInspectData | undefined;
-		const appleConfig = item?.configuration;
+		if (!item || typeof item !== "object") throw new Error(`Container runtime returned invalid metadata for ${name}`);
+		return item;
+	}
+
+	private async validateExistingContainer(name: string, state: GitRefState) {
+		const item = await this.inspectContainer(name);
+		const appleConfig = item.configuration;
 		const dockerConfig = item?.Config;
 		const image = appleConfig?.image?.reference ?? dockerConfig?.Image ?? item?.ImageName;
 		const normalizeImage = (value: string) => value.replace(/^(?:docker\.io\/library\/|docker\.io\/|localhost\/)/, "");
@@ -1154,6 +1248,33 @@ class SandboxEngine {
 			for (const [key, expected] of Object.entries(this.containerLabels(state))) {
 				if (labels[key] !== expected) throw new Error(`Existing sandbox container ${name} has incompatible metadata (${key}); preserve or remove it before retrying`);
 			}
+		}
+	}
+
+	private dockerPublishArgs(): string[] {
+		if (this.config.runtime !== "docker" || this.config.dockerPortMode === "disabled") return [];
+		return portsFromRange(this.config.dockerPortRange).flatMap((port) => [
+			"--publish",
+			this.config.dockerPortMode === "fixed" ? `127.0.0.1:${port}:${port}` : `127.0.0.1::${port}`,
+		]);
+	}
+
+	private async refreshDockerPortMappings() {
+		this.dockerPortMappings = [];
+		if (this.config.runtime !== "docker" || this.config.dockerPortMode === "disabled" || !this.containerName) return;
+		const item = await this.inspectContainer(this.containerName);
+		const ports = item.NetworkSettings?.Ports ?? {};
+		for (const containerPort of portsFromRange(this.config.dockerPortRange)) {
+			const bindings = ports[`${containerPort}/tcp`];
+			const binding = bindings?.find((candidate) => candidate.HostIp === "127.0.0.1");
+			const hostPort = Number(binding?.HostPort);
+			if (!binding || !Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65_535) {
+				throw new Error(`Docker did not publish container port ${containerPort} on host loopback`);
+			}
+			if (this.config.dockerPortMode === "fixed" && hostPort !== containerPort) {
+				throw new Error(`Docker published container port ${containerPort} on unexpected fixed host port ${hostPort}`);
+			}
+			this.dockerPortMappings.push({ containerPort, hostIp: "127.0.0.1", hostPort });
 		}
 	}
 
@@ -1300,10 +1421,12 @@ class SandboxEngine {
 			this.reusedContainer = true;
 			await this.validateExistingContainer(targetName, state);
 			await this.startContainer(targetName);
+			await this.refreshDockerPortMappings();
 			await this.prepareGitRefWorkspace(ctx);
 			this.started = true;
 			ctx?.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", `sandbox: ${targetName} (reused)`));
-			ctx?.ui.notify(`Reusing container sandbox: ${targetName}`, "info");
+			const ports = formatDockerPortMappings(this.dockerPortMappings);
+			ctx?.ui.notify(`Reusing container sandbox: ${targetName}${ports ? `\nDocker ports: ${ports}` : ""}`, "info");
 			return;
 		}
 
@@ -1312,6 +1435,10 @@ class SandboxEngine {
 			"--name",
 			targetName,
 			...Object.entries(this.containerLabels(state)).flatMap(([key, value]) => ["--label", `${key}=${value}`]),
+			...this.dockerPublishArgs(),
+			...(this.config.runtime === "docker" && this.config.hostGateway
+				? ["--add-host", `${this.config.hostGateway}:host-gateway`]
+				: []),
 			"-e",
 			"HOME=/tmp/pi-home",
 			"-e",
@@ -1324,10 +1451,12 @@ class SandboxEngine {
 			"infinity",
 		]);
 		await this.runtimeExecChecked(["start", targetName]);
+		await this.refreshDockerPortMappings();
 		await this.prepareGitRefWorkspace(ctx);
 		this.started = true;
 		ctx?.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", `sandbox: ${targetName}`));
-		ctx?.ui.notify(`Container sandbox ready: ${targetName}`, "info");
+		const ports = formatDockerPortMappings(this.dockerPortMappings);
+		ctx?.ui.notify(`Container sandbox ready: ${targetName}${ports ? `\nDocker ports: ${ports}` : ""}`, "info");
 	}
 
 	async ensure(ctx?: ExtensionContext) {
@@ -2185,6 +2314,7 @@ fi
 			this.containerName = undefined;
 			this.started = false;
 			this.reusedContainer = false;
+			this.dockerPortMappings = [];
 			this.depsInstalled = false;
 			await this.releaseCurrentBranchLock();
 		}
@@ -2194,6 +2324,7 @@ fi
 class SandboxLifecycleComponent {
 	constructor(private readonly engine: SandboxEngine) {}
 	ensure(ctx?: ExtensionContext) { return this.engine.ensure(ctx); }
+	getDockerPortMappings() { return this.engine.getDockerPortMappings(); }
 	execShell(command: string, cwd: string, options: { onData: (data: Buffer) => void; signal?: AbortSignal; timeout?: number }) {
 		return this.engine.execShell(command, cwd, options);
 	}
@@ -2260,6 +2391,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerFlag("no-sandbox", { description: "Disable container sandbox tool backend", type: "boolean", default: false });
 	pi.registerFlag("sandbox-runtime", { description: "Container runtime: container, docker, or podman", type: "string" });
 	pi.registerFlag("sandbox-image", { description: "Container image for sandbox tools", type: "string" });
+	pi.registerFlag("sandbox-docker-port-mode", { description: "Docker port publishing: disabled, dynamic, or fixed (default: dynamic)", type: "string" });
+	pi.registerFlag("sandbox-docker-port-range", { description: "Docker container port or range to publish (default: 8000-8010)", type: "string" });
 	pi.registerFlag("sandbox-name", { description: "Stable sandbox/ref name; container name is derived from repo, branch, and this name", type: "string" });
 	pi.registerFlag("sandbox-commit-target", { description: "Checkpoint destination: sandbox-ref or current-branch", type: "string" });
 	pi.registerFlag("sandbox-checkpoint-frequency", { description: "Automatic checkpoint boundary: turn, agent, or settled", type: "string" });
@@ -2754,6 +2887,14 @@ export default function (pi: ExtensionAPI) {
 			? ` After each ${checkpointBoundary}, sandbox changes receive an AI-generated commit message and fast-forward the checked-out host branch ${gitRefState?.baseBranch ?? ""}; the host worktree is updated after validation.`
 			: ` After each ${checkpointBoundary}, sandbox changes receive an AI-generated commit message and are imported through a validated, hard-coded checkpoint operation into host ref ${gitRefState?.sandboxRef ?? `${GIT_REF_NAMESPACE}/...`}; the checked-out host branch/worktree is not modified.`;
 		const gitNote = `${destinationNote} Host-untracked files are handled with hostUntrackedFiles=${config.hostUntrackedFiles}.`;
+		const dockerPorts = formatDockerPortMappings(sandbox.lifecycle.getDockerPortMappings());
+		const portNote = config.runtime === "docker"
+			? config.dockerPortMode === "disabled"
+				? ` Docker port publishing is disabled; development servers are not reachable from the host through Docker.` +
+					(config.hostGateway ? ` The Docker host is reachable from the sandbox as ${config.hostGateway}.` : "")
+				: ` Development servers that must be reachable outside the sandbox must use a port in ${config.dockerPortRange} and bind to 0.0.0.0. ${config.dockerPortMode === "fixed" ? "Fixed" : "Dynamic"} host loopback mappings: ${dockerPorts || "unavailable"}.` +
+					(config.hostGateway ? ` The Docker host is reachable from the sandbox as ${config.hostGateway}.` : "")
+			: "";
 		const rebaseNote = sandbox.workspace.hasPendingRebase()
 			? " A sandbox rebase is currently pending. Normal automatic checkpoints are paused. Resolve any conflicts inside the container, stage them, run GIT_EDITOR=true git rebase --continue until complete, and leave the tracked worktree clean; never attempt to modify the host ref directly."
 			: "";
@@ -2762,20 +2903,21 @@ export default function (pi: ExtensionAPI) {
 				event.systemPrompt +
 				"\n\nTool execution note: file and shell tools run inside an isolated container copy of the current working directory. Use the normal tool paths and commands; dependency installs and tests run in that container." +
 				gitNote +
+				portNote +
 				rebaseNote,
 		};
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
-		if (sandbox.workspace.getConfig().checkpointFrequency === "turn") await sandbox.checkpoints.checkpoints.autoCheckpoint(ctx);
+		if (sandbox.workspace.getConfig().checkpointFrequency === "turn") await sandbox.checkpoints.autoCheckpoint(ctx);
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
-		if (sandbox.workspace.getConfig().checkpointFrequency === "agent") await sandbox.checkpoints.checkpoints.autoCheckpoint(ctx);
+		if (sandbox.workspace.getConfig().checkpointFrequency === "agent") await sandbox.checkpoints.autoCheckpoint(ctx);
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
-		if (sandbox.workspace.getConfig().checkpointFrequency === "settled") await sandbox.checkpoints.checkpoints.autoCheckpoint(ctx);
+		if (sandbox.workspace.getConfig().checkpointFrequency === "settled") await sandbox.checkpoints.autoCheckpoint(ctx);
 		if (!sandbox.workspace.hasPendingRebase()) return;
 		try {
 			const result = await sandbox.rebase.finalize(ctx);
@@ -2910,11 +3052,16 @@ export default function (pi: ExtensionAPI) {
 				case "status": {
 					const config = sandbox.workspace.getConfig();
 					const gitRefState = sandbox.workspace.getGitRefState();
+					const dockerPorts = formatDockerPortMappings(sandbox.lifecycle.getDockerPortMappings());
 					ctx.ui.notify(
 						[
 							`Container sandbox: ${sandbox.workspace.isEnabled() ? "enabled" : "disabled by --no-sandbox"}`,
 							`Runtime: ${config.runtime}`,
 							`Image: ${config.image}`,
+							`Docker port mode: ${config.runtime === "docker" ? config.dockerPortMode : "(not applicable)"}`,
+							`Docker container port range: ${config.runtime === "docker" && config.dockerPortMode !== "disabled" ? config.dockerPortRange : "(not published)"}`,
+							`Docker host mappings: ${config.runtime === "docker" ? dockerPorts || (config.dockerPortMode === "disabled" ? "(disabled)" : "(available after container starts)") : "(not applicable)"}`,
+							`Docker host gateway: ${config.runtime === "docker" && config.hostGateway ? config.hostGateway : "(disabled)"}`,
 							`Commit target: ${config.commitTarget}`,
 							`Checkpoint frequency: ${config.checkpointFrequency}`,
 							`Git ref namespace: ${GIT_REF_NAMESPACE} (sandbox-ref target)`,
