@@ -11,6 +11,8 @@ The extension routes `read`, `write`, `edit`, `bash`, `ls`, `find`, `grep`, and 
 
 - [Features](#features)
 - [Requirements](#requirements)
+- [Installation](#installation)
+- [Uninstallation](#uninstallation)
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
 - [Commit targets](#commit-targets)
@@ -40,15 +42,131 @@ The extension routes `read`, `write`, `edit`, `bash`, `ls`, `find`, `grep`, and 
 
 ## Requirements
 
-- Pi with this extension installed at `~/.pi/agent/extensions/container-sandbox/index.ts`.
+- Pi with Git package support.
 - A supported runtime: Apple `container`, `docker`, or `podman`.
 - A Git repository with an existing `HEAD` commit.
 - A clean tracked host worktree. Untracked files are handled separately by `hostUntrackedFiles`.
 - A container image with the tools needed by the project. Core sandbox operations require common shell utilities, Bash, Git, and tar; sandbox `grep` requires ripgrep.
 
+## Installation
+
+Pi packages execute with the installing user's full permissions. Review [`index.ts`](index.ts) and [SECURITY.md](SECURITY.md) before installation.
+
+### Install from GitHub
+
+Install globally for the current user:
+
+```bash
+pi install https://github.com/kjrjay/pi-sandbox
+```
+
+Or use Pi's Git shorthand:
+
+```bash
+pi install git:github.com/kjrjay/pi-sandbox
+```
+
+Install only for the current trusted project:
+
+```bash
+pi install -l https://github.com/kjrjay/pi-sandbox
+```
+
+Project-local installation writes to `.pi/settings.json`, which can be shared with the project. Pi installs the package after the project is trusted.
+
+To pin a release, append a tag or commit:
+
+```bash
+pi install git:github.com/kjrjay/pi-sandbox@v0.1.0
+```
+
+Pinned refs remain fixed during package updates. Install a newer ref explicitly when upgrading a pinned installation.
+
+### Try without installing
+
+Load the extension temporarily for one Pi invocation:
+
+```bash
+pi -e https://github.com/kjrjay/pi-sandbox
+```
+
+### Update
+
+Update an unpinned installation:
+
+```bash
+pi update --extensions
+```
+
+Use `pi list` to inspect installed package sources. Restart Pi after installation, or run `/reload` in an existing session.
+
+### Manual installation
+
+Alternatively, clone the repository into Pi's global extension directory:
+
+```bash
+git clone https://github.com/kjrjay/pi-sandbox.git \
+  ~/.pi/agent/extensions/container-sandbox
+```
+
+Pi auto-discovers `index.ts` from that directory. Pull updates with Git and run `/reload` afterward.
+
+## Uninstallation
+
+Before uninstalling, checkpoint or preserve any work needed from `refs/pi-sandbox/*`, then stop active sandbox operations.
+
+Remove a global Pi package using the same unpinned source form used for installation:
+
+```bash
+pi remove https://github.com/kjrjay/pi-sandbox
+```
+
+For a project-local installation:
+
+```bash
+pi remove -l https://github.com/kjrjay/pi-sandbox
+```
+
+If the package was installed with Git shorthand, use:
+
+```bash
+pi remove git:github.com/kjrjay/pi-sandbox
+```
+
+Use `pi list` when unsure which source is recorded. Restart Pi or run `/reload` after removal.
+
+For a manual clone, remove its directory:
+
+```bash
+rm -rf ~/.pi/agent/extensions/container-sandbox
+```
+
+Package removal intentionally does not delete configuration, caches, containers, or Git refs. Remove these only after reviewing anything that may contain recoverable work.
+
+Optional configuration and cache cleanup:
+
+```bash
+rm -f ~/.pi/agent/extensions/container-sandbox.json
+rm -rf ~/.pi/agent/cache/container-sandbox
+```
+
+Docker containers created by the extension can be listed by their managed label:
+
+```bash
+docker ps -a --filter label=pi.container-sandbox.managed=true
+```
+
+Sandbox and recovery refs can be reviewed in each affected repository with:
+
+```bash
+git for-each-ref refs/pi-sandbox/ refs/pi-sandbox-recovery/
+```
+
+Do not delete containers or refs until their work is committed, exported, or no longer needed.
+
 ## Quick start
 
-The extension is auto-discovered from its current global location. Add a partial global configuration at:
+After installation, add a partial global configuration at:
 
 ```text
 ~/.pi/agent/extensions/container-sandbox.json
