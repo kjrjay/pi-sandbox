@@ -1,8 +1,24 @@
 {
-  "name": "pi-container-sandbox",
+  "name": "@kjrjay/pi-sandbox",
   "version": "0.1.0",
   "description": "Run Pi file and shell tools in an isolated Apple Container, Docker, or Podman workspace",
   "type": "module",
+  "license": "MIT",
+  "author": "Jayakar Katika",
+  "homepage": "https://github.com/kjrjay/pi-sandbox#readme",
+  "bugs": {
+    "url": "https://github.com/kjrjay/pi-sandbox/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kjrjay/pi-sandbox.git"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
   "keywords": [
     "pi-package",
     "pi",
@@ -11,9 +27,11 @@
     "docker",
     "podman"
   ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/kjrjay/pi-sandbox.git"
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "./tests/run.sh"
   },
   "pi": {
     "extensions": [
