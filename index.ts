@@ -10,8 +10,8 @@
  * bash, grep, find, ls.
  *
  * Config files, merged with project taking precedence when trusted:
- *   ~/.pi/agent/extensions/container-sandbox.json
- *   <cwd>/.pi/container-sandbox.json
+ *   ~/.pi/agent/extensions/pi-sandbox.json
+ *   <cwd>/.pi/pi-sandbox.json
  *
  * Useful flags:
  *   --no-sandbox                         Disable this extension for one run
@@ -433,8 +433,8 @@ function cliNonNegativeInteger(pi: ExtensionAPI, name: string): number | undefin
 }
 
 function loadConfig(cwd: string, projectTrusted: boolean, pi: ExtensionAPI): SandboxConfig {
-	const globalConfig = readJson(path.join(getAgentDir(), "extensions", "container-sandbox.json"));
-	const projectConfig = projectTrusted ? readJson(path.join(cwd, CONFIG_DIR_NAME, "container-sandbox.json")) : {};
+	const globalConfig = readJson(path.join(getAgentDir(), "extensions", "pi-sandbox.json"));
+	const projectConfig = projectTrusted ? readJson(path.join(cwd, CONFIG_DIR_NAME, "pi-sandbox.json")) : {};
 	const config = mergeConfig(mergeConfig(DEFAULT_CONFIG, globalConfig), projectConfig);
 
 	const runtime = cliChoice(pi, "sandbox-runtime", ["container", "docker", "podman"] as const);

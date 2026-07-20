@@ -146,7 +146,7 @@ Package removal intentionally does not delete configuration, caches, containers,
 Optional configuration and cache cleanup:
 
 ```bash
-rm -f ~/.pi/agent/extensions/container-sandbox.json
+rm -f ~/.pi/agent/extensions/pi-sandbox.json
 rm -rf ~/.pi/agent/cache/container-sandbox
 ```
 
@@ -169,7 +169,7 @@ Do not delete containers or refs until their work is committed, exported, or no 
 After installation, add a partial global configuration at:
 
 ```text
-~/.pi/agent/extensions/container-sandbox.json
+~/.pi/agent/extensions/pi-sandbox.json
 ```
 
 Example Docker configuration:
@@ -189,7 +189,7 @@ Example Docker configuration:
 A trusted project can override global values with:
 
 ```text
-<project>/.pi/container-sandbox.json
+<project>/.pi/pi-sandbox.json
 ```
 
 Start Pi from a clean Git worktree. The container is created lazily before the first agent run. Use `/sandbox status` to inspect the effective configuration and active container.
@@ -358,8 +358,8 @@ Mutating commands wait for the active agent to become idle.
 Configuration precedence, from lowest to highest:
 
 1. Built-in defaults.
-2. Global `~/.pi/agent/extensions/container-sandbox.json`.
-3. Trusted project `<project>/.pi/container-sandbox.json`.
+2. Global `~/.pi/agent/extensions/pi-sandbox.json`.
+3. Trusted project `<project>/.pi/pi-sandbox.json`.
 4. CLI flags.
 
 Both JSON files may contain only the values they override. Unknown keys and invalid values are rejected.
