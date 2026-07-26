@@ -1,6 +1,6 @@
 {
   "name": "@kjrjay/pi-sandbox",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Run Pi file and shell tools in an isolated Apple Container or Docker workspace",
   "type": "module",
   "license": "MIT",
