@@ -1,7 +1,7 @@
 {
   "name": "@kjrjay/pi-sandbox",
   "version": "0.1.0",
-  "description": "Run Pi file and shell tools in an isolated Apple Container, Docker, or Podman workspace",
+  "description": "Run Pi file and shell tools in an isolated Apple Container or Docker workspace",
   "type": "module",
   "license": "MIT",
   "author": "Jayakar Katika",
@@ -24,8 +24,7 @@
     "pi",
     "sandbox",
     "container",
-    "docker",
-    "podman"
+    "docker"
   ],
   "publishConfig": {
     "access": "public"

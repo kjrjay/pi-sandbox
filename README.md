@@ -15,7 +15,7 @@ The extension routes `read`, `write`, `edit`, `bash`, `ls`, `find`, `grep`, and 
 - [Uninstallation](#uninstallation)
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
-- [Commit targets](#commit-targets)
+- [Targets](#targets)
 - [Checkpoints](#checkpoints)
 - [Workspace and lifecycle](#workspace-and-lifecycle)
 - [Host-untracked files](#host-untracked-files)
@@ -31,9 +31,9 @@ The extension routes `read`, `write`, `edit`, `bash`, `ls`, `find`, `grep`, and 
 
 ## Features
 
-- Routes Pi's standard file and shell tools into Apple Container, Docker, or Podman.
+- Routes Pi's standard file and shell tools into Apple Container or Docker.
 - Keeps host credentials, sessions, model calls, and the repository `.git` directory outside the container.
-- Creates validated Git checkpoints under an isolated sandbox ref or fast-forwards the current branch.
+- Creates validated Git checkpoints on an isolated sandbox branch or fast-forwards the current branch.
 - Supports automatic checkpoints after a model turn, agent run, or fully settled cycle.
 - Preserves or removes containers according to configurable lifecycle policy.
 - Supports protected host-untracked overlays, lockfile-based dependency bootstrap, and shared package caches.
@@ -43,7 +43,7 @@ The extension routes `read`, `write`, `edit`, `bash`, `ls`, `find`, `grep`, and 
 ## Requirements
 
 - Pi with Git package support.
-- A supported runtime: Apple `container`, `docker`, or `podman`.
+- A supported runtime: Apple `container` or `docker`.
 - A Git repository with an existing `HEAD` commit.
 - A clean tracked host worktree. Untracked files are handled separately by `hostUntrackedFiles`.
 - A container image with the tools needed by the project. Core sandbox operations require common shell utilities, Bash, Git, and tar; sandbox `grep` requires ripgrep.
@@ -117,7 +117,7 @@ Pi auto-discovers `index.ts` from that directory. Pull updates with Git and run 
 
 ## Uninstallation
 
-Before uninstalling, checkpoint or preserve any work needed from `refs/pi-sandbox/*`, then stop active sandbox operations.
+Before uninstalling, checkpoint or preserve any named target branches and generated `refs/heads/pi-sandbox-*` branches, then stop active sandbox operations.
 
 Remove a global npm installation:
 
@@ -160,13 +160,15 @@ Docker containers created by the extension can be listed by their managed label:
 docker ps -a --filter label=pi.container-sandbox.managed=true
 ```
 
-Sandbox and recovery refs can be reviewed in each affected repository with:
+Generated sandbox branches and recovery refs can be reviewed in each affected repository with:
 
 ```bash
-git for-each-ref refs/pi-sandbox/ refs/pi-sandbox-recovery/
+git for-each-ref refs/heads/pi-sandbox- refs/pi-sandbox-recovery/
 ```
 
-Do not delete containers or refs until their work is committed, exported, or no longer needed.
+Named `sandbox:<branch>` targets use the exact branch name and should be reviewed separately.
+
+Do not delete containers, branches, or refs until their work is committed, exported, or no longer needed.
 
 ## Quick start
 
@@ -182,7 +184,7 @@ Example Docker configuration:
 {
   "runtime": "docker",
   "image": "pi-tool-sandbox:latest",
-  "commitTarget": "sandbox-ref",
+  "target": "sandbox",
   "checkpointFrequency": "agent",
   "dockerPortMode": "dynamic",
   "dockerPortRange": "8000-8010",
@@ -204,28 +206,28 @@ Start Pi from a clean Git worktree. The container is created lazily before the f
 2. It creates a local clone from the authoritative host Git ref and copies that workspace into the container.
 3. Pi's normal file and shell tools execute against the container copy.
 4. At the configured boundary, the extension stages and validates sandbox changes.
-5. It transfers Git objects through a temporary bundle and publishes them to the selected commit target.
+5. It transfers Git objects through a temporary bundle and publishes them to the selected target.
 
 Runtime command capture is bounded on the host. Bash output streams through Pi without retaining an unbounded duplicate buffer.
 
-## Commit targets
+## Targets
 
-### `sandbox-ref` — default
+### `sandbox` — default
 
-Each session checkpoints into an isolated host ref:
+Each session checkpoints into an isolated generated local host branch:
 
 ```text
-refs/pi-sandbox/<base-branch>/<sandbox-name-or-session-id>
+refs/heads/pi-sandbox-<session-hash>
 ```
 
-The checked-out host branch, index, and worktree remain unchanged. Session-derived names support parallel feature work. An explicit `sandboxName` provides stable ref and container identity, but two processes must not concurrently reuse the same named sandbox.
+Use `target: "sandbox:<branch>"` for an exact stable branch and container identity. For example, `sandbox:feat/feature-b` publishes to `refs/heads/feat/feature-b`. Named branches are limited to 96 characters and must be valid Git branch names. Container names use a bounded `pi-<repo>-<readable-branch>-<hash>` form derived from the repository path and exact target ref. The checked-out host branch, index, and worktree remain unchanged. The extension refuses to update a target branch while it is checked out in any host worktree. A host lock in the repository's common Git directory prevents concurrent Pi sessions from owning the same target branch and container. The lock is reserved during session startup, before the container is created; an idle open Pi session therefore continues to own its configured target.
 
-### `current-branch`
+
+### `current`
 
 Validated checkpoints fast-forward the branch that was checked out when the sandbox started, updating the host index and worktree. This mode:
 
 - requires an attached local branch;
-- ignores `sandboxName`;
 - uses a per-worktree lock to prevent concurrent sessions;
 - refuses publication if the host branch or tracked worktree changes unexpectedly.
 
@@ -248,7 +250,7 @@ At each checkpoint, the extension:
 3. Reconstructs one commit using the expected parent and host Git author identity.
 4. Transfers it through a temporary Git bundle and host ref.
 5. Validates object integrity, parentage, ancestry, and commit count.
-6. Advances the sandbox ref with compare-and-swap or guarded-fast-forwards the current branch.
+6. Advances the sandbox branch with compare-and-swap or guarded-fast-forwards the current branch.
 
 Copied host-untracked overlay files are removed from the checkpoint index. `/sandbox checkpoint` runs the same operation manually.
 
@@ -302,7 +304,7 @@ In both publishing modes, the server inside the container must bind to `0.0.0.0`
 
 `dockerPortRange` accepts one port or an ascending range of at most 100 ports. Set `hostGateway` to a hostname such as `host.docker.internal` to add Docker's `host-gateway` mapping. Host-gateway access is disabled by default because it lets sandbox processes connect to services on the Docker host.
 
-These options do not affect Apple Container or Podman.
+These options do not affect Apple Container.
 
 ## Dependencies and package caches
 
@@ -319,7 +321,7 @@ New containers bind-mount the extension-owned cache directory:
 ~/.pi/agent/cache/container-sandbox/packages:/var/cache/pi-packages
 ```
 
-Download caches are shared across containers. Project `node_modules` and virtual environments remain inside each workspace. `installDepsOnReuse` controls whether bootstrap runs again for reused containers.
+Download caches are shared across containers. Project `node_modules` and virtual environments remain inside each workspace. With `installDeps: "auto"`, bootstrap runs whenever a new or reused sandbox workspace starts.
 
 ## Review agent
 
@@ -340,7 +342,7 @@ Requested commits must exist in the sandbox clone. Set `gitCloneDepth: 0` when r
 
 If conflicts occur, automatic checkpoints pause. Resolve conflicts inside the container, stage them, and continue the rebase. Use `/sandbox rebase-status` to inspect progress or `/sandbox rebase-abort` to restore the pre-rebase sandbox state.
 
-Non-fast-forward rewrites of the host base branch are rejected. If the host branch advances during final `current-branch` publication, the rebased work is preserved under `refs/pi-sandbox-recovery/*`.
+Non-fast-forward rewrites of the host base branch are rejected. If the host branch advances during final `current` publication, the rebased work is preserved under `refs/pi-sandbox-recovery/*`.
 
 ## Commands
 
@@ -348,6 +350,7 @@ Non-fast-forward rewrites of the host base branch are rejected. If the host bran
 |---|---|
 | `/sandbox` | Show status. |
 | `/sandbox status` | Show effective configuration and runtime status. |
+| `/sandbox attach <host-image-path> [-- message]` | Attach an explicitly selected host screenshot to a new user message. |
 | `/sandbox checkpoint` | Create and publish a checkpoint immediately. |
 | `/sandbox review [-- instructions]` | Review sandbox commits with the read-only reviewer. |
 | `/sandbox rebase` | Rebase sandbox work onto the latest host base. |
@@ -356,6 +359,14 @@ Non-fast-forward rewrites of the host base branch are rejected. If the host bran
 | `/sandbox stop` | Checkpoint and stop or remove the container. |
 
 Mutating commands wait for the active agent to become idle.
+
+`/sandbox attach` is intended for screenshots that exist only on the host. It reads the explicitly named host image, uses Pi's normal image normalization and resizing, and sends it directly as multimodal message content; it does not copy the image into the container. For example:
+
+```text
+/sandbox attach ~/Desktop/screenshot.png -- Explain the error shown here
+```
+
+Without `-- message`, the default prompt is `Please inspect this screenshot.` If the agent is busy, the image and message are queued as a follow-up.
 
 ## Configuration
 
@@ -370,15 +381,13 @@ Both JSON files may contain only the values they override. Unknown keys and inva
 
 | Option | Default | Description |
 |---|---:|---|
-| `runtime` | `"container"` | `container`, `docker`, or `podman`. |
+| `runtime` | `"docker"` | `container` or `docker`. |
 | `image` | `"pi-tool-sandbox:latest"` | Container image used by the sandbox. |
 | `dockerPortMode` | `"dynamic"` | `disabled`, `dynamic`, or `fixed`. |
 | `dockerPortRange` | `"8000-8010"` | Docker container port or ascending range, up to 100 ports. |
 | `hostGateway` | `""` | Optional Docker hostname mapped to `host-gateway`. |
-| `sandboxName` | `""` | Stable sandbox-ref/container identity; empty uses the session ID. |
-| `commitTarget` | `"sandbox-ref"` | `sandbox-ref` or `current-branch`. |
+| `target` | `"sandbox"` | `sandbox`, exact `sandbox:<branch>` (up to 96 characters), or `current`. |
 | `checkpointFrequency` | `"turn"` | `turn`, `agent`, or `settled`. |
-| `installDepsOnReuse` | `false` | Run dependency bootstrap again after container reuse. |
 | `hostUntrackedFiles` | `"ignore"` | `ignore` or `copy`. |
 | `gitCloneDepth` | `1` | Local clone depth; `0` uses full history. |
 | `gitCommitCoAuthor` | `"Pi <pi@localhost>"` | Optional commit-message co-author trailer. |
@@ -399,10 +408,8 @@ Example complete configuration:
   "dockerPortMode": "dynamic",
   "dockerPortRange": "8000-8010",
   "hostGateway": "",
-  "sandboxName": "",
-  "commitTarget": "sandbox-ref",
+  "target": "sandbox",
   "checkpointFrequency": "agent",
-  "installDepsOnReuse": false,
   "hostUntrackedFiles": "ignore",
   "gitCloneDepth": 1,
   "gitCommitCoAuthor": "Pi <pi@localhost>",
@@ -425,17 +432,16 @@ Commit author and committer identity come from host Git configuration. The exten
 | Flag | Description |
 |---|---|
 | `--no-sandbox` | Disable sandbox routing for this run. Standard tools execute on the host. |
-| `--sandbox-runtime <container\|docker\|podman>` | Override the runtime. |
+| `--sandbox-runtime <container\|docker>` | Override the runtime. |
 | `--sandbox-image <image>` | Override the image. |
 | `--sandbox-docker-port-mode <disabled\|dynamic\|fixed>` | Override Docker port publication mode. |
 | `--sandbox-docker-port-range <port\|start-end>` | Override Docker container ports. |
-| `--sandbox-name <name>` | Override stable sandbox identity. |
-| `--sandbox-commit-target <sandbox-ref\|current-branch>` | Override checkpoint target. |
+| `--sandbox-target <sandbox\|sandbox:branch\|current>` | Override the checkpoint target and optional exact branch. |
 | `--sandbox-checkpoint-frequency <turn\|agent\|settled>` | Override checkpoint boundary. |
 | `--sandbox-git-clone-depth <n>` | Override local clone depth. |
 | `--sandbox-install-deps <auto\|never>` | Override dependency bootstrap. |
 | `--sandbox-lifecycle <remove\|stopped\|running>` | Override shutdown behavior. |
-| `--sandbox-env FOO,BAR` | Add an environment-variable allowlist. |
+| `--sandbox-env FOO,BAR` | Override the environment-variable allowlist. |
 
 ## Tests
 
@@ -449,7 +455,7 @@ The suite uses isolated Pi state, starts no containers, calls no models, and is 
 
 ## Security and limitations
 
-There are no model-callable host shell or host Git tools. Host commands use fixed internal operations. `current-branch` has a larger trust boundary because materializing commits can invoke repository-configured Git LFS or checkout filters.
+There are no model-callable host shell or host Git tools. Host commands use fixed internal operations. The `current` target has a larger trust boundary because materializing commits can invoke repository-configured Git LFS or checkout filters.
 
 The runtime, image, networking, shared writable package cache, forwarded environment variables, Git parsers, and other Pi extensions remain outside this extension's isolation guarantee.
 

@@ -14,7 +14,7 @@ The extension is designed to:
 - avoid mounting the host repository or its `.git` directory into the container;
 - expose only narrowly scoped, fixed host operations for workspace creation, checkpoint import, ref publication, review, rebase, and lifecycle management;
 - validate container-produced Git history before publishing it on the host;
-- leave the checked-out host branch and worktree unchanged when using the default `sandbox-ref` target.
+- leave the checked-out host branch and worktree unchanged when using the default `sandbox` target.
 
 These goals do not cover other Pi extensions, manually executed host commands, runtime vulnerabilities, or deliberate data exfiltration through allowed network and model access.
 
@@ -44,19 +44,19 @@ The sandbox deliberately has several controlled bridges to the host:
 - optional allowlisted environment variables;
 - optional Docker loopback port publication;
 - optional Docker `host-gateway` connectivity;
-- validated host Git ref updates and, in `current-branch` mode, host worktree updates.
+- validated host Git branch/ref updates and, with the `current` target, host worktree updates.
 
 These bridges are part of the trusted design surface, not isolation guarantees.
 
 ## Git publication security
 
-### `sandbox-ref` — safer default
+### `sandbox` — safer default
 
-Validated commits are imported under `refs/pi-sandbox/*`. The checked-out host branch, index, and worktree remain unchanged. The host repository's ref database is still intentionally modified.
+Validated commits are imported under normal local branches. Plain `sandbox` targets use generated `refs/heads/pi-sandbox-*` branches; `sandbox:<branch>` uses the exact named branch. The checked-out host branch, index, and worktree remain unchanged. The extension refuses to update a target branch that is checked out in any host worktree.
 
-Use this target when repository checkout filters are untrusted, host-worktree changes are undesirable, or sandbox output should be reviewed before integration.
+Because these are normal branches, commands such as `git push --all` may include them. Review push commands and refspecs before publishing. Use this target when repository checkout filters are untrusted, host-worktree changes are undesirable, or sandbox output should be reviewed before integration.
 
-### `current-branch`
+### `current`
 
 This mode has a larger host-side trust boundary. It guarded-fast-forwards and materializes validated commits in the checked-out host worktree.
 
@@ -69,7 +69,7 @@ The extension:
 - requires an in-container rebase after compatible host advancement;
 - preserves imported work under `refs/pi-sandbox-recovery/*` if final publication fails.
 
-Host checkout can invoke repository-configured Git LFS, smudge/process filters, attributes, and line-ending conversion. Prefer `sandbox-ref` when those behaviors are not trusted.
+Host checkout can invoke repository-configured Git LFS, smudge/process filters, attributes, and line-ending conversion. Prefer `sandbox` when those behaviors are not trusted.
 
 ### Checkpoint validation
 
@@ -96,9 +96,10 @@ Normal Pi operation may send prompts, file contents, and tool results to the sel
 Additionally:
 
 - commit-message generation sends a bounded staged diff to the active model;
-- `/sandbox review` sends the selected patch and lets the reviewer model inspect additional sandbox files through read-only tools.
+- `/sandbox review` sends the selected patch and lets the reviewer model inspect additional sandbox files through read-only tools;
+- `/sandbox attach <host-image-path> [-- message]` explicitly reads the named host image and sends its normalized contents directly to the active model. The image is not copied into the container, and the command can name a path outside the repository.
 
-Do not place secrets in files or output that an agent or reviewer can inspect. Review provider retention and privacy policies separately.
+Do not attach screenshots containing secrets or place secrets in files or output that an agent or reviewer can inspect. Review provider retention and privacy policies separately.
 
 ### Host-untracked files
 
@@ -144,8 +145,8 @@ Do not treat the shared cache as trusted evidence. Remove it if compromise is su
 
 ## Concurrency and recovery limitations
 
-- `current-branch` sessions use a per-worktree lock.
-- Explicitly named `sandbox-ref` containers are not yet locked across Pi processes. Concurrent reuse can interfere inside the container even though compare-and-swap prevents silent host-ref overwrite.
+- `current` sessions use a per-worktree lock.
+- Sandbox branch targets reserve a per-branch lock in the repository's common Git directory during session startup, preventing concurrent Pi processes from sharing the same target container. Idle open sessions retain ownership; locks owned by dead local processes are reclaimed.
 - A stopped or running container can contain work newer than its host target after a crash. Explicit automated crash-recovery tooling is not yet implemented; preserve and inspect such a container rather than deleting it blindly.
 - Container and model workflows currently rely on manual integration testing; the permanent automated suite covers the control plane without starting containers or calling models.
 
@@ -157,7 +158,7 @@ For stronger isolation within the extension's current design, start with:
 
 ```json
 {
-  "commitTarget": "sandbox-ref",
+  "target": "sandbox",
   "hostUntrackedFiles": "ignore",
   "passEnv": [],
   "dockerPortMode": "disabled",
@@ -172,6 +173,6 @@ Also:
 - use a minimal, pinned, trusted image;
 - avoid privileged containers and extra runtime mounts outside this extension;
 - restrict container networking at the runtime level when egress is unnecessary;
-- review sandbox refs before integrating them into a normal branch;
+- review sandbox branches before merging or pushing them;
 - keep Pi and the container runtime updated;
 - do not load unrelated or untrusted Pi extensions in the same process.

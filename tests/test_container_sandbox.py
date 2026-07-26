@@ -9,6 +9,7 @@ extensions are untouched.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import select
@@ -128,10 +129,8 @@ class ContainerSandboxTests(unittest.TestCase):
             "dockerPortMode": "dynamic",
             "dockerPortRange": "8000-8010",
             "hostGateway": "",
-            "sandboxName": "",
-            "commitTarget": "sandbox-ref",
+            "target": "sandbox",
             "checkpointFrequency": "agent",
-            "installDepsOnReuse": False,
             "hostUntrackedFiles": "ignore",
             "gitCloneDepth": 1,
             "gitCommitCoAuthor": "",
@@ -175,14 +174,115 @@ class ContainerSandboxTests(unittest.TestCase):
         self.assertTrue(explicit)
         self.assertEqual(implicit[-1].get("message"), explicit[-1].get("message"))
 
+    def test_attach_without_path_reports_usage_without_starting_container(self) -> None:
+        events = self.pi().command("attach-usage", "/sandbox attach")
+        notifications = self.notifications(events)
+        self.assertTrue(notifications)
+        self.assertTrue(
+            any(
+                event.get("notifyType") == "warning"
+                and "Usage: /sandbox attach <host-image-path> [-- message]" in str(event.get("message", ""))
+                for event in notifications
+            )
+        )
+        self.assertFalse(self.errors(events))
+
+    def test_attach_sends_host_image_and_message_without_starting_container(self) -> None:
+        image_path = self.root / "screenshot -- with spaces.png"
+        image_path.write_bytes(base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+        capture_extension = self.agent_dir / "capture-attachment.ts"
+        capture_extension.write_text(
+            """
+export default function (pi: any) {
+  pi.registerProvider("attachment-test", {
+    baseUrl: "http://127.0.0.1:1/v1",
+    apiKey: "test",
+    api: "openai-completions",
+    models: [{
+      id: "image-model",
+      name: "Image Model",
+      reasoning: false,
+      input: ["text", "image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 10000,
+      maxTokens: 1000,
+    }],
+  });
+  pi.on("input", (event: any, ctx: any) => {
+    if (event.source !== "extension" || !event.images?.length) return;
+    ctx.ui.notify(`Captured attachment: ${event.text}; ${event.images[0].mimeType}`, "info");
+    return { action: "handled" };
+  });
+}
+"""
+        )
+        events = self.pi(
+            "--extension", str(capture_extension),
+            "--provider", "attachment-test",
+            "--model", "image-model",
+        ).command(
+            "attach-image",
+            f'/sandbox attach "{image_path}" -- Explain this screenshot',
+        )
+        notifications = self.notifications(events)
+        self.assertTrue(
+            any(
+                "Captured attachment: Explain this screenshot; image/png" in str(event.get("message", ""))
+                for event in notifications
+            ),
+            notifications,
+        )
+        self.assertFalse(self.errors(events))
+
+    def test_builtin_runtime_defaults_to_docker(self) -> None:
+        (self.agent_dir / "extensions" / "pi-sandbox.json").write_text("{}")
+        events = self.pi().command("default-runtime", "/sandbox status")
+        notifications = self.notifications(events)
+        self.assertTrue(notifications)
+        message = str(notifications[-1].get("message", ""))
+        self.assertIn("Runtime: docker", message)
+        self.assertIn("Target: sandbox", message)
+        self.assertFalse(self.errors(events))
+
+    def test_named_target_lock_is_reported_before_prompt(self) -> None:
+        self.write_global_config({"target": "sandbox:feat-123"})
+        first_events = self.pi().command("first-owner", "/sandbox status")
+        self.assertFalse(self.errors(first_events))
+
+        second_events = self.pi().command("second-owner", "/sandbox status")
+        self.assertTrue(
+            any(
+                event.get("notifyType") == "error"
+                and "Sandbox target feat-123 is already owned by Pi session" in str(event.get("message", ""))
+                for event in self.notifications(second_events)
+            ),
+            second_events,
+        )
+        self.assertTrue(
+            any(
+                event.get("type") == "extension_ui_request"
+                and event.get("method") == "setStatus"
+                and "sandbox: locked (feat-123)" in str(event.get("statusText", ""))
+                for event in second_events
+            ),
+            second_events,
+        )
+        status_message = str(self.notifications(second_events)[-1].get("message", ""))
+        self.assertIn("Target lock: Sandbox target feat-123 is already owned by Pi session", status_message)
+        self.assertFalse(self.errors(second_events))
+
     def test_status_reports_lifecycle_and_checkpoint_frequency(self) -> None:
-        self.write_global_config({"lifecycle": "running", "checkpointFrequency": "settled"})
+        self.write_global_config({"lifecycle": "running", "checkpointFrequency": "settled", "target": "current"})
         events = self.pi().command("status", "/sandbox status")
         notifications = self.notifications(events)
         self.assertTrue(notifications)
         message = str(notifications[-1].get("message", ""))
         self.assertIn("Container lifecycle: running", message)
         self.assertIn("Checkpoint frequency: settled", message)
+        self.assertIn("Target: current", message)
+        self.assertIn("Sandbox identity: (current branch)", message)
         self.assertFalse(self.errors(events))
 
     def test_docker_network_configuration_is_reported_without_starting_docker(self) -> None:
@@ -207,12 +307,14 @@ class ContainerSandboxTests(unittest.TestCase):
             "--sandbox-runtime", "docker",
             "--sandbox-docker-port-mode", "fixed",
             "--sandbox-docker-port-range", "09000-09001",
+            "--sandbox-target", "sandbox:feat/feature-b",
         ).command("docker-cli", "/sandbox status")
         notifications = self.notifications(events)
         self.assertTrue(notifications)
         message = str(notifications[-1].get("message", ""))
         self.assertIn("Docker port mode: fixed", message)
         self.assertIn("Docker container port range: 9000-9001", message)
+        self.assertIn("Target: sandbox:feat/feature-b", message)
         self.assertFalse(self.errors(events))
 
     def test_disabled_docker_ports_are_reported(self) -> None:
@@ -239,6 +341,12 @@ class ContainerSandboxTests(unittest.TestCase):
     def test_invalid_cli_choices_are_rejected(self) -> None:
         cases = [
             (["--sandbox-runtime", "invalid-runtime"], "--sandbox-runtime must be one of"),
+            (["--sandbox-runtime", "podman"], "--sandbox-runtime must be one of"),
+            (["--sandbox-target", "sandbox:"], "sandbox branch must be a valid"),
+            (["--sandbox-target", "sandbox:HEAD"], "sandbox branch must be a valid"),
+            (["--sandbox-target", f"sandbox:{'a' * 97}"], "must not exceed 96 characters"),
+            (["--sandbox-target", "sandbox name"], "must be sandbox, sandbox:<branch>, or current"),
+            (["--sandbox-target", "branch"], "must be sandbox, sandbox:<branch>, or current"),
             (["--sandbox-lifecycle", "paused"], "--sandbox-lifecycle must be one of"),
             (["--sandbox-checkpoint-frequency", "prompt"], "--sandbox-checkpoint-frequency must be one of"),
             (["--sandbox-docker-port-mode", "random"], "--sandbox-docker-port-mode must be one of"),
@@ -250,14 +358,13 @@ class ContainerSandboxTests(unittest.TestCase):
         ]
         for index, (arguments, expected) in enumerate(cases):
             with self.subTest(arguments=arguments):
-                events = self.pi(*arguments).command(f"invalid-{index}", "/sandbox status")
-                self.assertTrue(any(expected in error for error in self.errors(events)), self.errors(events))
-
-    def test_auto_remove_configuration_has_migration_error(self) -> None:
-        config_path = self.agent_dir / "extensions" / "pi-sandbox.json"
-        config_path.write_text(json.dumps({"runtime": "container", "image": "test-image:latest", "autoRemove": False}))
-        events = self.pi().command("migration", "/sandbox status")
-        self.assertTrue(any("autoRemove was replaced by lifecycle" in error for error in self.errors(events)))
+                process = self.pi(*arguments)
+                try:
+                    events = process.command(f"invalid-{index}", "/sandbox status")
+                    self.assertTrue(any(expected in error for error in self.errors(events)), self.errors(events))
+                finally:
+                    process.close()
+                    self.processes.remove(process)
 
     def test_unknown_configuration_key_is_rejected(self) -> None:
         self.write_global_config({"lifecyle": "stopped"})

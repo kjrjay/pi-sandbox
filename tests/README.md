@@ -15,7 +15,7 @@ The suite is intentionally limited to fast control-plane tests and is expected t
 - does not read or modify the user's Pi credentials, sessions, settings, or discovered extensions;
 - creates temporary Git repositories and removes them during teardown.
 
-Covered behavior includes extension loading, status dispatch, unknown-command rejection, lifecycle and checkpoint-frequency reporting, Docker network configuration and validation, strict CLI validation, strict configuration validation, and `autoRemove` migration diagnostics.
+Covered behavior includes extension loading, status and attachment dispatch, target parsing, early named-target lock reporting, unknown-command rejection, lifecycle and checkpoint-frequency reporting, Docker network configuration and validation, and strict CLI/configuration validation.
 
 Override the Pi executable or per-request timeout when necessary:
 
