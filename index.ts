@@ -94,6 +94,24 @@ interface GitRefCheckpointResult {
 	message: string;
 }
 
+export function synchronizedCurrentBaseline(input: {
+	commitTarget: CommitTarget;
+	baseCommit: string;
+	hostHead: string;
+	containerHead: string;
+	workspaceStatus: string;
+	pendingRebase: boolean;
+}): string | undefined {
+	if (
+		input.commitTarget !== "current" ||
+		input.pendingRebase ||
+		input.workspaceStatus ||
+		input.containerHead !== input.hostHead ||
+		input.baseCommit === input.hostHead
+	) return undefined;
+	return input.hostHead;
+}
+
 interface PendingRebase {
 	oldBase: string;
 	newBase: string;
@@ -1435,6 +1453,38 @@ class SandboxEngine {
 		return this.config.gitCloneDepth > 0 ? [`--depth=${this.config.gitCloneDepth}`] : [];
 	}
 
+	private async refreshCurrentBaselineIfSynchronized(
+		state: GitRefState,
+		knownHostHead?: string,
+		knownContainerHead?: string,
+		knownWorkspaceStatus?: string,
+	): Promise<boolean> {
+		if (state.commitTarget !== "current" || this.pendingRebase) return false;
+		const hostHead = knownHostHead ?? await this.currentBranchHead(state);
+		if (state.baseCommit === hostHead) return false;
+		const containerHead = knownContainerHead ?? (await this.containerGitChecked(
+			["rev-parse", "--verify", "HEAD^{commit}"],
+			{ timeoutMs: 10_000 },
+		)).stdout.toString().trim();
+		if (containerHead !== hostHead) return false;
+		// Equal tips prove there is no unpublished container history. Requiring the
+		// entire workspace to be clean also ensures that refreshing stale session
+		// metadata cannot hide recoverable tracked or untracked sandbox work.
+		const workspaceStatus = knownWorkspaceStatus ?? await this.containerWorkspaceStatus();
+		const refreshedBaseline = synchronizedCurrentBaseline({
+			commitTarget: state.commitTarget,
+			baseCommit: state.baseCommit,
+			hostHead,
+			containerHead,
+			workspaceStatus,
+			pendingRebase: this.pendingRebase !== undefined,
+		});
+		if (!refreshedBaseline) return false;
+		state.baseCommit = refreshedBaseline;
+		this.pi.appendEntry("container-sandbox.git-ref-state", state);
+		return true;
+	}
+
 	private async prepareGitRefWorkspace(ctx?: ExtensionContext) {
 		if (!this.containerName) throw new Error("Sandbox container is not running");
 		const state = await this.ensureGitRefState(ctx);
@@ -1444,12 +1494,15 @@ class SandboxEngine {
 		await this.runtimeExecChecked(["exec", "-u", "root", this.containerName, "mkdir", "-p", state.repoRoot, "/tmp/pi-home"]);
 		let reseedExistingWorkspace = false;
 		if (await this.containerHasGitRepo(state.repoRoot)) {
-			const hostHead = await this.hostSandboxHead(state);
+			const hostHead = state.commitTarget === "current"
+				? await this.currentBranchHead(state)
+				: await this.hostSandboxHead(state);
 			const containerHead = (await this.containerGitChecked(["rev-parse", "--verify", "HEAD^{commit}"], { timeoutMs: 10_000 })).stdout
 				.toString()
 				.trim();
+			let workspaceStatus: string | undefined;
 			if (containerHead !== hostHead) {
-				const workspaceStatus = await this.containerWorkspaceStatus();
+				workspaceStatus = await this.containerWorkspaceStatus();
 				const hostKnowsContainerHead = (await runGit(["cat-file", "-e", `${containerHead}^{commit}`], { cwd: state.repoRoot, timeoutMs: 10_000 })).code === 0;
 				const hostAdvanced = hostKnowsContainerHead &&
 					(await runGit(["merge-base", "--is-ancestor", containerHead, hostHead], { cwd: state.repoRoot, timeoutMs: 30_000 })).code === 0;
@@ -1458,15 +1511,12 @@ class SandboxEngine {
 					// after the host advanced. Preserve it for /sandbox rebase.
 				} else if (!workspaceStatus && hostAdvanced) {
 					reseedExistingWorkspace = true;
-					if (state.commitTarget === "current") {
-						state.baseCommit = hostHead;
-						this.pi.appendEntry("container-sandbox.git-ref-state", state);
-					}
 				} else {
 					throw new Error(`${state.commitTarget} sandbox container is out of sync with ${state.sandboxRef}; preserve or inspect the container before retrying`);
 				}
 			}
 			if (!reseedExistingWorkspace) {
+				await this.refreshCurrentBaselineIfSynchronized(state, hostHead, containerHead, workspaceStatus);
 				await this.applyGitRefUntrackedFiles(state);
 				await this.runtimeExecChecked(["exec", "-u", "root", this.containerName, "chown", "-R", identity || "0:0", state.repoRoot, "/tmp/pi-home"]);
 				await this.runtimeExecChecked(["exec", "-u", "root", this.containerName, "chmod", "u+rwx", state.repoRoot, "/tmp/pi-home"]);
@@ -1505,6 +1555,7 @@ class SandboxEngine {
 			// turn would describe/export changes before the host fetches Git commits.
 			await this.copyDirectoryToContainer(cloneDir, state.repoRoot);
 			await this.applyGitRefUntrackedFiles(state);
+			await this.refreshCurrentBaselineIfSynchronized(state);
 		} finally {
 			await rm(temp, { recursive: true, force: true });
 		}

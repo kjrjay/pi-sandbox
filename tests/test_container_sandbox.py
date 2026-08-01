@@ -328,6 +328,51 @@ export default function (pi: any) {
         self.assertIn("Docker host mappings: (disabled)", message)
         self.assertFalse(self.errors(events))
 
+    def test_current_baseline_refresh_requires_a_clean_synchronized_workspace(self) -> None:
+        policy_extension = self.agent_dir / "baseline-policy-test.ts"
+        policy_extension.write_text(
+            f"""
+import {{ synchronizedCurrentBaseline }} from {json.dumps(str(EXTENSION_PATH))};
+
+export default function (pi: any) {{
+  pi.registerCommand("baseline-policy-test", {{
+    handler: async (_args: string, ctx: any) => {{
+      const common = {{
+        commitTarget: "current" as const,
+        baseCommit: "aaaaaaaa",
+        hostHead: "bbbbbbbb",
+        containerHead: "bbbbbbbb",
+        workspaceStatus: "",
+        pendingRebase: false,
+      }};
+      const cases = [
+        ["new clean container", common, "bbbbbbbb"],
+        ["existing clean container", {{ ...common }}, "bbbbbbbb"],
+        ["tracked changes", {{ ...common, workspaceStatus: " M tracked.txt" }}, undefined],
+        ["untracked changes", {{ ...common, workspaceStatus: "?? scratch.txt" }}, undefined],
+        ["unpublished history", {{ ...common, containerHead: "cccccccc" }}, undefined],
+        ["pending rebase", {{ ...common, pendingRebase: true }}, undefined],
+        ["sandbox target", {{ ...common, commitTarget: "sandbox" as const }}, undefined],
+      ] as const;
+      for (const [name, input, expected] of cases) {{
+        const actual = synchronizedCurrentBaseline(input);
+        if (actual !== expected) throw new Error(`${{name}}: expected ${{expected}}, got ${{actual}}`);
+      }}
+      ctx.ui.notify("baseline policy passed", "info");
+    }},
+  }});
+}}
+"""
+        )
+        events = self.pi("--extension", str(policy_extension)).command(
+            "baseline-policy", "/baseline-policy-test"
+        )
+        self.assertFalse(self.errors(events), self.errors(events))
+        self.assertTrue(
+            any("baseline policy passed" in str(event.get("message", "")) for event in self.notifications(events)),
+            events,
+        )
+
     def test_unknown_subcommand_is_rejected(self) -> None:
         events = self.pi().command("unknown", "/sandbox rebsae")
         self.assertTrue(
